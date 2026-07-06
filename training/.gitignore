@@ -1,0 +1,7 @@
+# Dataset GIỮ PRIVATE — không commit (zip + upload lên server riêng)
+dataset/
+dataset.zip
+# output train
+runs/
+*.log
+__pycache__/

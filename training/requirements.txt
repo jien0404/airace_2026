@@ -1,0 +1,8 @@
+# Cài trên server GPU (Python 3.9+). Khớp CUDA của server khi cài torch.
+torch>=2.1
+transformers>=4.44
+seqeval>=1.2
+numpy>=1.24
+accelerate>=0.30
+sentencepiece>=0.1.99   # tokenizer XLM-R
+protobuf>=3.20
