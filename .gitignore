@@ -3,3 +3,4 @@ test_baseline_models/vietmed_ner/output/
 test_baseline_models/vietmed_ner/vncorenlp/
 test_baseline_models/vietmed_ner/.venv/
 __pycache__/
+test_baseline_models/vietmed_ner/postprocess_output/

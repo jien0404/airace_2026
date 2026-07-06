@@ -31,31 +31,7 @@ import time
 import torch
 from transformers import AutoTokenizer, AutoModelForTokenClassification
 
-# --------------------------------------------------------------------------
-# Ánh xạ nhãn VietMed -> 5 loại của cuộc thi (chỉ tham khảo, dễ chỉnh).
-# Đặt None để loại bỏ khỏi output theo format cuộc thi.
-# --------------------------------------------------------------------------
-LABEL_MAP = {
-    "DRUGCHEMICAL":      "THUỐC",
-    "DISEASESYMTOM":     "TRIỆU_CHỨNG",   # <-- NHẬP NHẰNG: có thể là CHẨN_ĐOÁN
-    "DIAGNOSTICS":       "TÊN_XÉT_NGHIỆM",
-    "UNITCALIBRATOR":    "KẾT_QUẢ_XÉT_NGHIỆM",
-    # Các nhãn dưới đây không có trong 5 loại của đề -> bỏ:
-    "ORGAN":             None,
-    "TREATMENT":         None,
-    "SURGERY":           None,
-    "MEDDEVICETECHNIQUE": None,
-    "PREVENTIVEMED":     None,
-    "AGE":               None,
-    "GENDER":            None,
-    "DATETIME":          None,
-    "LOCATION":          None,
-    "FOODDRINK":         None,
-    "ORGANIZATION":      None,
-    "OCCUPATION":        None,
-    "TRANSPORTATION":    None,
-    "PERSONALCARE":      None,
-}
+from labels import LABEL_MAP  # ánh xạ 36 nhãn VietMed -> 5 loại cuộc thi
 
 
 def try_load_segmenter(vncorenlp_dir):

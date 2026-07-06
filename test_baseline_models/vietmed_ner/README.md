@@ -62,6 +62,32 @@ Các quan sát khác đáng ghi lại khi review output:
 - Tên thuốc tiếng Anh (`amlodipine 10 mg po daily`) có bị cắt vụn không?
 - Model có bắt nhầm nhiều thứ ngoài 5 loại (ORGAN, TREATMENT...) không?
 
+## 4b. Hậu xử lý (phương án A) — `postprocess.py`
+
+Giảm phân mảnh & false-positive từ output thô. Chạy **không cần GPU/torch**:
+
+```bash
+python postprocess.py     # đọc output/*.raw.json + ../../input, ghi postprocess_output/
+```
+
+Pipeline, **mỗi stage lưu riêng** để rà soát logic (`postprocess_output/<stage>/N.json`):
+
+| Stage | Việc làm |
+|---|---|
+| `stage1_stripped` | cắt dấu câu/khoảng trắng 2 đầu span (`po bid,`→`po bid`), bỏ span rỗng |
+| `stage2_filtered` | bỏ từ tiêu đề mục/từ chung (`BLACKLIST` trong `labels.py`) |
+| `stage3_merged` | nối span liền kề **cùng dòng**: same-type, hoặc gộp thuốc `tên+liều+đường dùng` |
+| `final` | map 5 loại + dedup (text+type) + format cuộc thi → **thư mục output cuối** |
+
+Nối span cố tình **bảo thủ**: chỉ nối khi khe hở giữa 2 span là khoảng trắng thuần,
+không xuống dòng, ≤3 ký tự → `buồn nôn, hay nôn` (có dấu phẩy) KHÔNG bị nối nhầm.
+Chỉnh nhãn/blacklist/nhóm thuốc trong `labels.py`.
+
+**A xử lý được:** gộp cụm thuốc (`metoprolol 25mg po bid`), bỏ tiêu đề mục (−~22%),
+strip dấu câu. **A KHÔNG xử lý được (cần bước sau):** phân mảnh *chéo loại* do model
+tự gán sai (vd `ngoại tâm thu nhĩ` bị xé DIAGNOSTICS/ORGAN), và tách
+CHẨN_ĐOÁN/TRIỆU_CHỨNG.
+
 ## 5. Chi tiết kỹ thuật
 
 - Subfolder của model trên HF **chỉ có** `config.json` + `pytorch_model.bin`
