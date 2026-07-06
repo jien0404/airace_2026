@@ -1,0 +1,11 @@
+# Core inference
+# Cài torch theo hạ tầng máy chạy:
+#   - GPU CUDA: xem https://pytorch.org (vd: pip install torch --index-url https://download.pytorch.org/whl/cu121)
+#   - CPU-only: pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.1
+transformers>=4.38
+sentencepiece>=0.1.99          # PhobertTokenizer cần
+protobuf>=3.20
+
+# Tùy chọn: word segmentation (khuyến nghị cho PhoBERT). Cần Java 8+.
+# py_vncorenlp

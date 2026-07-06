@@ -1,1 +1,5 @@
 medical_dataset/
+test_baseline_models/vietmed_ner/output/
+test_baseline_models/vietmed_ner/vncorenlp/
+test_baseline_models/vietmed_ner/.venv/
+__pycache__/
