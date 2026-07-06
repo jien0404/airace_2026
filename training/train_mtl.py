@@ -68,20 +68,20 @@ class MtlDataset(Dataset):
 
 def collate(batch, pad):
     m = max(len(b["input_ids"]) for b in batch)
-    out = {"input_ids": [], "attention_mask": [], "labels": [], "assert_mask": [], "assert_tags": []}
+    out = {"input_ids": [], "attention_mask": [], "labels": [], "assert_mask": [], "assert_labels": []}
     for b in batch:
         n = m - len(b["input_ids"])
         out["input_ids"].append(b["input_ids"] + [pad] * n)
         out["attention_mask"].append([1] * len(b["input_ids"]) + [0] * n)
         out["labels"].append(b["labels"] + [-100] * n)
         out["assert_mask"].append(b["assert_mask"] + [0] * n)
-        out["assert_tags"].append(b["assert_tags"] + [[0, 0, 0]] * n)
+        out["assert_labels"].append(b["assert_tags"] + [[0, 0, 0]] * n)
     return {
         "input_ids": torch.tensor(out["input_ids"], dtype=torch.long),
         "attention_mask": torch.tensor(out["attention_mask"], dtype=torch.long),
         "labels": torch.tensor(out["labels"], dtype=torch.long),
         "assert_mask": torch.tensor(out["assert_mask"], dtype=torch.long),
-        "assert_tags": torch.tensor(out["assert_tags"], dtype=torch.long),
+        "assert_labels": torch.tensor(out["assert_labels"], dtype=torch.long),
     }
 
 
@@ -105,7 +105,7 @@ def evaluate(model, loader, id2label, device):
         # assertion micro-F1 trên token có mask
         ap = (torch.sigmoid(out["assert_logits"]) > 0.5).long()
         am = batch["assert_mask"].unsqueeze(-1)
-        gt = batch["assert_tags"] * am
+        gt = batch["assert_labels"] * am
         pp = ap * am
         a_tp += int(((pp == 1) & (gt == 1)).sum())
         a_fp += int(((pp == 1) & (gt == 0)).sum())
@@ -157,7 +157,7 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     total = int(len(tl) * args.epochs)
     sch = get_linear_schedule_with_warmup(opt, int(total * args.warmup), total)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
+    scaler = torch.amp.GradScaler("cuda", enabled=args.fp16)
 
     best_f1, step = -1.0, 0
     os.makedirs(args.out, exist_ok=True)
@@ -167,7 +167,7 @@ def main():
         for batch in tl:
             batch = {k: v.to(device) for k, v in batch.items()}
             opt.zero_grad()
-            with torch.cuda.amp.autocast(enabled=args.fp16):
+            with torch.amp.autocast("cuda", enabled=args.fp16):
                 out = model(**batch)
                 loss = out["loss"]
             scaler.scale(loss).backward()
