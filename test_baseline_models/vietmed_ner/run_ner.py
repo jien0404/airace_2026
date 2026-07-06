@@ -246,6 +246,9 @@ def main():
                     help="Thư mục xuất (mặc định: ./output)")
     ap.add_argument("--model", default="leduckhai/VietMed-NER")
     ap.add_argument("--subfolder", default="phobert-base-v2-VietMed-NER")
+    ap.add_argument("--tokenizer", default="vinai/phobert-base-v2",
+                    help="Tokenizer nguồn: subfolder của model KHÔNG có file "
+                         "tokenizer, nên nạp từ base PhoBERT (mặc định).")
     ap.add_argument("--segment", action="store_true",
                     help="Bật word segmentation bằng VnCoreNLP (khuyến nghị nếu có Java)")
     ap.add_argument("--vncorenlp_dir", default="./vncorenlp")
@@ -258,10 +261,12 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[cfg] device={device}  model={args.model}/{args.subfolder}  segment={args.segment}",
-          file=sys.stderr)
+    print(f"[cfg] device={device}  model={args.model}/{args.subfolder}  "
+          f"tokenizer={args.tokenizer}  segment={args.segment}", file=sys.stderr)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, subfolder=args.subfolder)
+    # Subfolder của model chỉ có config.json + pytorch_model.bin (không có
+    # vocab/bpe.codes) -> tokenizer nạp từ base PhoBERT.
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     model = AutoModelForTokenClassification.from_pretrained(args.model, subfolder=args.subfolder)
     model.to(device).eval()
     id2label = {int(k): v for k, v in model.config.id2label.items()}

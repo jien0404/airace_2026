@@ -64,6 +64,9 @@ Các quan sát khác đáng ghi lại khi review output:
 
 ## 5. Chi tiết kỹ thuật
 
+- Subfolder của model trên HF **chỉ có** `config.json` + `pytorch_model.bin`
+  (không kèm file tokenizer), nên tokenizer nạp từ base `vinai/phobert-base-v2`
+  (đổi bằng `--tokenizer`).
 - Suy luận ở mức **word-level** (gán nhãn subtoken đầu của mỗi từ), không dùng
   `offset_mapping` → chạy được cả với slow `PhobertTokenizer`.
 - `position` tính trên text gốc để `text` xuất ra khớp input (đề chấm `text` bằng
