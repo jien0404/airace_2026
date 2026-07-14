@@ -49,13 +49,19 @@ class MtlDataset(Dataset):
         r = self.rows[i]
         toks, tags = r["tokens"], r["ner_tags"]
         am, av = r["assert_mask"], r["assert_tags"]
+        n_prefix = r.get("n_prefix", 0)     # token đầu = header ngữ cảnh -> KHÔNG tính loss
         ids, labs, amask, avecs = [], [], [], []
-        for tok, tag, m, v in zip(toks, tags, am, av):
+        for wi, (tok, tag, m, v) in enumerate(zip(toks, tags, am, av)):
             sub = self.tok.encode(tok, add_special_tokens=False) or [self.unk]
             ids.extend(sub)
-            labs.extend([self.l2i[tag]] + [-100] * (len(sub) - 1))
-            amask.extend([m] + [0] * (len(sub) - 1))
-            avecs.extend([v] + [[0, 0, 0]] * (len(sub) - 1))
+            if wi < n_prefix:               # prefix: model THẤY nhưng bỏ qua loss (label -100)
+                labs.extend([-100] * len(sub))
+                amask.extend([0] * len(sub))
+                avecs.extend([[0, 0, 0]] * len(sub))
+            else:
+                labs.extend([self.l2i[tag]] + [-100] * (len(sub) - 1))
+                amask.extend([m] + [0] * (len(sub) - 1))
+                avecs.extend([v] + [[0, 0, 0]] * (len(sub) - 1))
             if len(ids) >= self.max_len - 2:
                 break
         ids = ids[: self.max_len - 2]; labs = labs[: self.max_len - 2]

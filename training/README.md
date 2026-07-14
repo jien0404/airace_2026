@@ -28,19 +28,38 @@ token-level:
 - `train_ner.py` align subword THỦ CÔNG (nhãn ở subword đầu, -100 phần còn lại) nên chạy
   được CẢ tokenizer slow (ViHealthBERT/PhoBERT) lẫn fast (XLM-R).
 
+### Windowing SECTION-AWARE (train + infer NHẤT QUÁN — `windowing.py`)
+Data có cấu trúc mục ("1." "2." "3."). Cửa sổ được cắt **theo mục**, KHÔNG vắt ngang 2 mục
+(giữ ngữ cảnh historical/family/type sạch), gói nguyên dòng ≤ `max_words` (không xé entity).
+Mục dài hơn `max_words` -> tách nhiều window; window nối tiếp mang **header mục làm prefix
+ngữ cảnh** (đưa vào model nhưng KHÔNG tính loss / KHÔNG decode — `n_prefix` trong dataset).
+- **`windowing.make_windows` dùng CHUNG** cho `build_ner_dataset` (train) và `predict` (infer)
+  -> nhất quán tuyệt đối. Đã test: gộp token content mọi window == đúng chuỗi token note
+  (offset chuẩn, mỗi token decode đúng 1 lần).
+- ⚠ **`--max_words` khi predict PHẢI khớp lúc build** (mặc định 110 ở cả hai — đừng đổi lệch).
+
 ### (Đã build sẵn trên máy local, chỉ cần upload)
 ```
 training/dataset/
-  train.jsonl  validation.jsonl  test.jsonl   # {tokens:[...], ner_tags:[...]}
-  labels.txt                                   # 11 nhãn BIO
+  train.jsonl  validation.jsonl  test.jsonl   # {tokens, ner_tags, assert_mask, assert_tags}
+  labels.txt  assertions.txt                   # 11 nhãn BIO + 3 assertion
 ```
-Muốn build lại (nếu sinh thêm data):
+
+Build lại từ data MỚI (đã sửa convention theo test public + gold thật):
 ```bash
 python -m training.build_ner_dataset \
-    --llm data_gen/generated/train_v1 \
-    --extra data_gen/generated/no-llm_train_v1 \
-    --out training/dataset --val 0.1 --test 0.1
+    --llm  data_gen/generated/public_gold \   # GOLD thật (100 file test public) -> tách val/test REALISTIC
+    --extra data_gen/generated/synth_800 \     # synth LLM (convention đã khớp) -> chỉ vào train
+    --oversample 5 \                           # lặp gold ×5 để nó có trọng số cao (chuẩn nhất)
+    --out training/dataset --val 0.12 --test 0.12
 ```
+- **Vì sao gold làm `--llm`**: val/test lấy từ 100 file THẬT của test public -> chỉ số dev SÁT
+  điểm nộp thật; synth chỉ để tăng volume/đa dạng nên vào train.
+- **oversample 5**: 76 gold_train ×5 = 380, cân với 800 synth (~32% trọng số real-data).
+  Chỉnh 4-6 tùy muốn nghiêng về real (cao hơn = bám phong cách thật/typo nhiều hơn).
+
+> **Nộp CUỐI (sau khi chọn được epoch/hyperparam tốt)**: build lại `--val 0 --test 0`
+> để đưa TẤT CẢ 100 gold + synth vào train, rồi train lại -> tận dụng hết real-data.
 
 ## Quy trình trên server GPU
 
@@ -48,7 +67,7 @@ python -m training.build_ner_dataset \
 2. **Upload dataset**: nén `training/dataset` thành `dataset.zip` (đã tạo sẵn ở local),
    tải lên server, giải nén vào `training/dataset/`:
    ```bash
-   cd <repo>/training && unzip dataset.zip -d dataset   # -> training/dataset/*.jsonl
+   cd <repo>/training && unzip -o dataset.zip           # zip đã chứa dataset/ -> training/dataset/*.jsonl
    ```
 3. **Cài môi trường** (khớp CUDA server; cài torch theo hướng dẫn pytorch.org nếu cần):
    ```bash
@@ -93,6 +112,36 @@ runs/<model>/best/              model + tokenizer + heads.pt + mtl_meta.json
 runs/<model>/test_metrics.json  NER_F1 + ASSERT_F1 trên test
 ```
 Log in `classification_report` chi tiết F1 theo từng loại entity.
+
+## FAQ — quyết định thiết kế (đọc trước khi train)
+
+**1. 900 note (100 gold + 800 synth) đã đủ chưa?**
+Đủ để ra model NER dùng được, KHÔNG phải nhiều. Fine-tune encoder có sẵn cần ÍT data
+(vài trăm→vài nghìn note; ở đây ~24k entity). Ràng buộc thật là **độ nhất quán nhãn +
+khớp phân phối** (DE_BAI: "bài toán dữ liệu"), không phải số lượng thô. Muốn tăng: sinh
+thêm synth (2-5k, đa dạng persona) — lợi ích giảm dần; 100 gold thật vẫn là phần quý nhất.
+
+**2. Fine-tune model đã pretrained có bị "quên kiến thức cũ" (catastrophic forgetting)?**
+KHÔNG lo ở đây. Forgetting chỉ là vấn đề khi train TUẦN TỰ nhiều task rồi cần giữ task cũ.
+Ta chỉ có MỘT task (NER của mình) → ta CỐ TÌNH tái dụng encoder, "quên" mục tiêu MLM gốc là
+vô hại. Cái ta giữ là **biểu diễn ngữ cảnh** (tiếng Việt, thuật ngữ y khoa, code-mix Anh-Việt).
+
+**3. Kiến thức pretrained có làm "nhiễu" không? Có nên dùng model CHƯA pretrained?**
+KHÔNG. Với ~900 note, train từ đầu (from scratch) là bất khả thi — encoder cần HÀNG TỶ token
+để học ngôn ngữ. Pretrained là NỀN MÓNG giúp giảm nhu cầu data cả nghìn lần, không phải nhiễu.
+Rủi ro thật KHÔNG phải "pretrained làm nhiễu" mà là **overfit vào phong cách synth** → chống
+bằng: oversample gold thật, ít epoch (3-5), early-stop theo val gold, LR nhỏ (2-3e-5), clip grad.
+
+**4. Vì sao encoder token-classification chứ không phải LLM sinh?**
+DE_BAI: `text_score` = WER cần span khớp CHỮ GỐC. Encoder token-classification cho span+offset
+"miễn phí" (cắt đúng ký tự nguồn); LLM sinh tự do dễ trôi chữ → mất điểm WER. Đây cũng là runtime
+≤9B, self-host, không API — khớp ràng buộc thi.
+
+**5. Chiến lược data cho điểm public tốt nhất (rồi mới tới private):**
+- Real gold (100) = phân phối & typo THẬT của test → quý nhất, oversample.
+- Synth (800) = phủ đa dạng bệnh/thuốc/xét nghiệm, convention đã khớp → nền volume.
+- val/test = gold thật để chọn model. Nộp cuối: gộp hết vào train, train lại.
+- Chỉ **điểm nộp public là chân lý** — dùng nó để chốt, val gold chỉ là tín hiệu sớm.
 
 ## Lưu ý
 - Model tải từ HuggingFace Hub -> server cần internet (hoặc pre-download rồi trỏ `--model`

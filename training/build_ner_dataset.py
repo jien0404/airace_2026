@@ -23,6 +23,8 @@ import re
 import unicodedata
 from pathlib import Path
 
+from .windowing import make_windows
+
 TYPES = ["TRIỆU_CHỨNG", "CHẨN_ĐOÁN", "TÊN_XÉT_NGHIỆM", "KẾT_QUẢ_XÉT_NGHIỆM", "THUỐC"]
 # assertion CHỈ cho 3 loại này (DE_BAI); XN/kết quả luôn rỗng -> không giám sát.
 ASSERT_TYPES = {"TRIỆU_CHỨNG", "CHẨN_ĐOÁN", "THUỐC"}
@@ -71,33 +73,18 @@ def bio_tags(tokens, entities):
 
 
 def note_to_windows(text, entities, max_words=110):
-    """text -> list cửa sổ {tokens, ner_tags}. Gộp theo dòng, entity gọn trong dòng."""
-    text = _norm(text)
-    # tách dòng giữ offset
-    lines, base = [], 0
-    for ln in text.split("\n"):
-        lines.append((ln, base))
-        base += len(ln) + 1  # + '\n'
-    windows = []
-    cur_tok, cur_tag, cur_am, cur_av = [], [], [], []
-    for ln, b in lines:
-        toks = tokenize_line(ln, b)
+    """text -> list cửa sổ SECTION-AWARE {tokens, ner_tags, assert_*, n_prefix}.
+    n_prefix token đầu = header mục làm NGỮ CẢNH (train sẽ bỏ qua loss trên chúng)."""
+    out = []
+    for w in make_windows(text, max_words):
+        toks = w["prefix"] + w["content"]      # prefix (header ngữ cảnh) đứng trước
         if not toks:
             continue
-        tags, amask, avecs = bio_tags(toks, entities)
-        surf = [t[0] for t in toks]
-        if cur_tok and len(cur_tok) + len(surf) > max_words:
-            windows.append({"tokens": cur_tok, "ner_tags": cur_tag,
-                            "assert_mask": cur_am, "assert_tags": cur_av})
-            cur_tok, cur_tag, cur_am, cur_av = [], [], [], []
-        cur_tok += surf
-        cur_tag += tags
-        cur_am += amask
-        cur_av += avecs
-    if cur_tok:
-        windows.append({"tokens": cur_tok, "ner_tags": cur_tag,
-                        "assert_mask": cur_am, "assert_tags": cur_av})
-    return windows
+        tags, amask, avecs = bio_tags(toks, entities)   # header -> O (không phải entity)
+        out.append({"tokens": [t[0] for t in toks], "ner_tags": tags,
+                    "assert_mask": amask, "assert_tags": avecs,
+                    "n_prefix": len(w["prefix"])})
+    return out
 
 
 def load_notes(d):
@@ -110,11 +97,17 @@ def load_notes(d):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--llm", required=True, help="thư mục data LLM (nguồn chính, để tách val/test)")
-    ap.add_argument("--extra", default=None, help="thư mục data phụ (no-LLM), chỉ vào train")
+    ap.add_argument("--llm", required=True,
+                    help="nguồn CHÍNH để tách val/test (nên là GOLD thật: public_gold). "
+                         "Phần còn lại của nguồn này vào train (được oversample).")
+    ap.add_argument("--extra", nargs="+", default=None,
+                    help="thư mục data phụ (synth LLM), chỉ vào train. Cho nhiều được.")
     ap.add_argument("--out", default="training/dataset")
     ap.add_argument("--val", type=float, default=0.1)
     ap.add_argument("--test", type=float, default=0.1)
+    ap.add_argument("--oversample", type=int, default=1,
+                    help="lặp phần TRAIN của nguồn --llm (gold thật) K lần để tăng trọng số "
+                         "vì nó chuẩn phân phối nhất (khuyến nghị 4-6 khi --llm=public_gold).")
     ap.add_argument("--max_words", type=int, default=110)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -126,10 +119,14 @@ def main():
     n_val = int(len(llm) * args.val)
     test_notes = llm[:n_test]
     val_notes = llm[n_test:n_test + n_val]
-    train_notes = llm[n_test + n_val:]
+    gold_train = llm[n_test + n_val:]
+    train_notes = list(gold_train) * max(1, args.oversample)   # oversample gold thật
     if args.extra:
-        train_notes = train_notes + load_notes(args.extra)
-        rng.shuffle(train_notes)
+        for d in args.extra:
+            train_notes = train_notes + load_notes(d)
+    rng.shuffle(train_notes)
+    print(f"[mix] gold_train={len(gold_train)}×{args.oversample}={len(gold_train)*max(1,args.oversample)} "
+          f"+ extra -> train_notes={len(train_notes)} | val={len(val_notes)} test={len(test_notes)}")
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

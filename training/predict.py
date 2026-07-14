@@ -17,52 +17,51 @@ import unicodedata
 import torch
 
 from .model import MultiTaskNER
-from .build_ner_dataset import TOK_RE, ASSERTIONS, ASSERT_TYPES
-
-
-def tokenize(text):
-    return [(m.group(), m.start(), m.end()) for m in TOK_RE.finditer(text)]
-
-
-def chunk_tokens(tokens, tokenizer, max_len):
-    """Chia token thành cửa sổ sao cho tổng subword <= max_len-2. Trả list (chunk_tokens,
-    subword_ids_per_token)."""
-    unk = tokenizer.unk_token_id or 0
-    chunks, cur, cur_sub, n_sub = [], [], [], 0
-    for tok in tokens:
-        sub = tokenizer.encode(tok[0], add_special_tokens=False) or [unk]
-        if cur and n_sub + len(sub) > max_len - 2:
-            chunks.append((cur, cur_sub)); cur, cur_sub, n_sub = [], [], 0
-        cur.append(tok); cur_sub.append(sub); n_sub += len(sub)
-    if cur:
-        chunks.append((cur, cur_sub))
-    return chunks
+from .build_ner_dataset import ASSERTIONS, ASSERT_TYPES
+from .windowing import make_windows
 
 
 @torch.no_grad()
-def predict_note(text, model, tokenizer, meta, device, max_len=256, assert_thr=0.5):
+def predict_note(text, model, tokenizer, meta, device, max_len=256, assert_thr=0.5,
+                 max_words=110):
+    """SECTION-AWARE (khớp train): cắt window theo mục, window nối tiếp mang header mục làm
+    PREFIX ngữ cảnh (đưa vào model nhưng KHÔNG decode). Chỉ decode token CONTENT -> mỗi token
+    note được gán đúng 1 lần, offset chuẩn."""
     text = unicodedata.normalize("NFC", text)
     id2label = {int(k): v for k, v in meta["id2label"].items()}
-    tokens = tokenize(text)
     bos = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.cls_token_id
     eos = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.sep_token_id
+    unk = tokenizer.unk_token_id or 0
 
-    tok_labels = []      # nhãn BIO cho từng token
-    tok_assert = []      # vec 3 xác suất cho từng token
-    for chunk_toks, chunk_sub in chunk_tokens(tokens, tokenizer, max_len):
-        ids = [bos]
-        first_pos = []   # vị trí subword đầu mỗi token (trong input_ids)
-        for sub in chunk_sub:
-            first_pos.append(len(ids)); ids.extend(sub)
-        ids.append(eos)
-        inp = torch.tensor([ids], device=device)
-        att = torch.ones_like(inp)
-        out = model(inp, att)
-        ner = out["ner_logits"][0].argmax(-1).cpu().tolist()
-        asr = torch.sigmoid(out["assert_logits"][0]).cpu().tolist()
-        for p in first_pos:
-            tok_labels.append(id2label.get(ner[p], "O"))
-            tok_assert.append(asr[p])
+    tokens = []          # (tok,s,e) content theo thứ tự = đúng chuỗi token note
+    tok_labels = []      # nhãn BIO tương ứng
+    tok_assert = []      # vec 3 xác suất
+    for w in make_windows(text, max_words):
+        content, prefix = w["content"], w["prefix"]
+        if not content:
+            continue
+        c_sub = [tokenizer.encode(t[0], add_special_tokens=False) or [unk] for t in content]
+        p_sub = [s for t in prefix
+                 for s in (tokenizer.encode(t[0], add_special_tokens=False) or [unk])]
+        i = 0
+        while i < len(content):
+            ids = [bos]
+            if 0 < len(p_sub) <= max_len - 40:        # prefix ngữ cảnh nếu còn chỗ
+                ids += p_sub
+            first_pos, start = [], i
+            while i < len(content) and len(ids) + len(c_sub[i]) <= max_len - 1:
+                first_pos.append(len(ids)); ids += c_sub[i]; i += 1
+            if i == start:                            # 1 token quá dài -> cắt
+                first_pos.append(len(ids)); ids += c_sub[i][:max_len - len(ids) - 1]; i += 1
+            ids.append(eos)
+            inp = torch.tensor([ids], device=device)
+            out = model(inp, torch.ones_like(inp))
+            ner = out["ner_logits"][0].argmax(-1).cpu().tolist()
+            asr = torch.sigmoid(out["assert_logits"][0]).cpu().tolist()
+            for k, pos in enumerate(first_pos):
+                tokens.append(content[start + k])
+                tok_labels.append(id2label.get(ner[pos], "O"))
+                tok_assert.append(asr[pos])
 
     # BIO decode -> span
     ents = []
@@ -95,6 +94,8 @@ def main():
     ap.add_argument("--input_dir", default="input")
     ap.add_argument("--out_dir", default="output")
     ap.add_argument("--max_len", type=int, default=256)
+    ap.add_argument("--max_words", type=int, default=110,
+                    help="độ dài window (word) — PHẢI khớp lúc build dataset để nhất quán")
     ap.add_argument("--assert_thr", type=float, default=0.5)
     args = ap.parse_args()
 
@@ -113,7 +114,8 @@ def main():
     for fp in files:
         name = os.path.splitext(os.path.basename(fp))[0]
         text = open(fp, encoding="utf-8").read()
-        ents = predict_note(text, model, tokenizer, meta, device, args.max_len, args.assert_thr)
+        ents = predict_note(text, model, tokenizer, meta, device, args.max_len,
+                            args.assert_thr, args.max_words)
         with open(os.path.join(args.out_dir, f"{name}.json"), "w", encoding="utf-8") as f:
             json.dump(ents, f, ensure_ascii=False, indent=2)
         print(f"  {name}: {len(ents)} entity", flush=True)
