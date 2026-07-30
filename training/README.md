@@ -1,5 +1,71 @@
 # training — Fine-tune NER **multi-task** (type + assertion) song song 2 model
 
+## Pipeline v2 hiện hành
+
+Phần còn lại của README mô tả lịch sử model v1. Batch mới dùng dataset từ
+[`dataset_factory`](../dataset_factory/README.md) và model hybrid:
+
+- BIO head tìm boundary;
+- span head kiểm tra type/abstain khi hai head bất đồng;
+- assertion head ở mức entity;
+- sampled loss cho token `O`;
+- sliding window có overlap, không phụ thuộc cấu trúc ba mục;
+- RAW không bị NFC hóa trước khi lấy offset.
+
+### Dựng dataset (chạy trên máy có repo đầy đủ)
+
+`dataset_factory.run` đã đóng băng. Luồng hiện hành:
+
+```bash
+# 1. sinh draft synthetic (xem dataset_factory/README.md)
+python -m dataset_factory.pilot generate --pilot datasets/pilots/train_trial_3000_a_v1 ...
+
+# 2. gộp synthetic + gt2 + part1 thành corpus mức bản ghi; Part 3 chỉ làm test
+python -m training.build_ner_corpus \
+  --pilot datasets/pilots/train_trial_3000_a_v1 \
+  --out datasets/ner_v1/track_a
+
+# 3. cắt cửa sổ trượt cho model v2
+python -m training.build_dataset_v2 \
+  --dataset-root datasets/ner_v1 --out-root training/dataset_v2 --tracks A
+```
+
+Phân vai split và chính sách assertion nằm trong docstring của
+[`build_ner_corpus.py`](build_ner_corpus.py) và `datasets/ner_v1/track_a/manifest.json`.
+
+### Train / infer / chấm (máy GPU chỉ cần `training/` + gói dataset)
+
+```bash
+python -m training.train_v2 \
+  --data-dir training/dataset_v2/track_a \
+  --model xlm-roberta-base \
+  --out runs/v2/track_a_xlmr --epochs 4 --fp16
+
+python -m training.predict_v2 \
+  --model-dir runs/v2/track_a_xlmr/best \
+  --input-dir eval/input_turn2 --out-dir runs/v2/track_a_xlmr/pred_part3
+
+python -m training.score_local \
+  --pred runs/v2/track_a_xlmr/pred_part3 --gold-zip eval/gold_part3.zip
+
+python -m normalize.run --in_dir runs/v2/track_a_xlmr/pred_part3 --out_dir output_v2_norm
+```
+
+[`score_local.py`](score_local.py) chấm theo **chồng lấn + đúng type**, ranh giới không tính —
+đúng cơ chế đã cô lập trên leaderboard. Chọn checkpoint theo `overlap.f1`, đừng theo
+`boundary_f1_reference_only`.
+
+`training/` không import `dataset_factory` (dùng [`schema_v2.py`](schema_v2.py)) nên máy train
+chỉ cần pull thư mục này.
+
+Ma trận segment/document/hybrid, A/B/C và hai backbone nằm trong
+[`experiments/`](../experiments/README.md).
+
+> ⛔ Các lệnh build dùng `public_gold`/`synth_800` bên dưới là lịch sử của dataset cũ, đã chuyển
+> vào `data_gen/_archive/generated_runs/old_part1/`. Không train batch mới trước khi generator
+> đạt [`business_rules/DATASET_CONTRACT.md`](../business_rules/DATASET_CONTRACT.md) và dry-run
+> qua `training.verify_dataset`.
+
 Train **ViHealthBERT-syllable** + **XLM-R base** cho bước NER, **multi-task**:
 - head TYPE: 5 loại (TRIỆU_CHỨNG, CHẨN_ĐOÁN, TÊN_XÉT_NGHIỆM, KẾT_QUẢ_XÉT_NGHIỆM, THUỐC).
 - head ASSERTION: 3 nhãn nhị phân (isNegated/isFamily/isHistorical) — 1 model ra CẢ type
@@ -45,7 +111,7 @@ training/dataset/
   labels.txt  assertions.txt                   # 11 nhãn BIO + 3 assertion
 ```
 
-Build lại từ data MỚI (đã sửa convention theo test public + gold thật):
+Mẫu lệnh lịch sử (không dùng nguyên trạng cho batch mới):
 ```bash
 python -m training.build_ner_dataset \
     --llm  data_gen/generated/public_gold \   # GOLD thật (100 file test public) -> tách val/test REALISTIC

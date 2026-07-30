@@ -102,12 +102,19 @@ def main():
                          "Phần còn lại của nguồn này vào train (được oversample).")
     ap.add_argument("--extra", nargs="+", default=None,
                     help="thư mục data phụ (synth LLM), chỉ vào train. Cho nhiều được.")
+    ap.add_argument("--test-dir", default=None,
+                    help="nếu đặt: TOÀN BỘ note của thư mục này -> test (đo chất lượng nguồn "
+                         "--llm khi test trên phân phối khác, vd --llm=synth --test-dir=public_gold).")
     ap.add_argument("--out", default="training/dataset")
     ap.add_argument("--val", type=float, default=0.1)
     ap.add_argument("--test", type=float, default=0.1)
     ap.add_argument("--oversample", type=int, default=1,
                     help="lặp phần TRAIN của nguồn --llm (gold thật) K lần để tăng trọng số "
                          "vì nó chuẩn phân phối nhất (khuyến nghị 4-6 khi --llm=public_gold).")
+    ap.add_argument("--llm-ner-only", action="store_true",
+                    help="ZERO assertion supervision cho window TRAIN từ nguồn --llm: dùng nó CHỈ "
+                         "cho NER, để assertion học từ --extra (phân phối tốt hơn). Hợp khi --llm "
+                         "gán thiếu assertion, vd gt2 (assertion+ 9.9%% vs test 29%%).")
     ap.add_argument("--max_words", type=int, default=110)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -115,18 +122,28 @@ def main():
     rng = random.Random(args.seed)
     llm = load_notes(args.llm)
     rng.shuffle(llm)
-    n_test = int(len(llm) * args.test)
-    n_val = int(len(llm) * args.val)
-    test_notes = llm[:n_test]
-    val_notes = llm[n_test:n_test + n_val]
-    gold_train = llm[n_test + n_val:]
-    train_notes = list(gold_train) * max(1, args.oversample)   # oversample gold thật
+    if args.test_dir:
+        # TOÀN BỘ --test-dir -> test; --llm chỉ tách val + train (đo chất lượng nguồn --llm)
+        test_notes = load_notes(args.test_dir)
+        n_val = int(len(llm) * args.val)
+        val_notes = llm[:n_val]
+        base_train = llm[n_val:]
+    else:
+        n_test = int(len(llm) * args.test)
+        n_val = int(len(llm) * args.val)
+        test_notes = llm[:n_test]
+        val_notes = llm[n_test:n_test + n_val]
+        base_train = llm[n_test + n_val:]
+    for r in base_train:
+        r["_ner_only"] = args.llm_ner_only    # đánh dấu provenance trước khi trộn
+    train_notes = list(base_train) * max(1, args.oversample)   # oversample nguồn --llm
     if args.extra:
         for d in args.extra:
-            train_notes = train_notes + load_notes(d)
+            train_notes = train_notes + load_notes(d)          # --extra giữ assertion
     rng.shuffle(train_notes)
-    print(f"[mix] gold_train={len(gold_train)}×{args.oversample}={len(gold_train)*max(1,args.oversample)} "
-          f"+ extra -> train_notes={len(train_notes)} | val={len(val_notes)} test={len(test_notes)}")
+    print(f"[mix] base_train={len(base_train)}×{args.oversample}={len(base_train)*max(1,args.oversample)} "
+          f"+ extra -> train_notes={len(train_notes)} | val={len(val_notes)} test={len(test_notes)}"
+          + (f" (test-dir={args.test_dir})" if args.test_dir else ""))
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -138,7 +155,11 @@ def main():
         n_win = n_ent = 0
         with (out / f"{name}.jsonl").open("w", encoding="utf-8") as f:
             for note in notes:
+                ner_only = note.get("_ner_only", False)
                 for w in note_to_windows(note["text"], note["entities"], args.max_words):
+                    if ner_only:      # tắt giám sát assertion cho window nguồn --llm
+                        w["assert_mask"] = [0] * len(w["assert_mask"])
+                        w["assert_tags"] = [[0, 0, 0] for _ in w["assert_tags"]]
                     if not any(t != "O" for t in w["ner_tags"]) and rng.random() < 0.5:
                         continue  # bớt cửa sổ toàn O (giữ 1 nửa cho ngữ cảnh âm)
                     f.write(json.dumps(w, ensure_ascii=False) + "\n")
