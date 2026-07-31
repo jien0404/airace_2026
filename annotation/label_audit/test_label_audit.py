@@ -186,3 +186,23 @@ class SpanAndTypeScreenTest(unittest.TestCase):
         })
         self.assertEqual(change["proposed_type"], "KẾT_QUẢ_XÉT_NGHIỆM")
         self.assertEqual(change["proposed_assertions"], [])
+
+
+class InputSignatureTest(unittest.TestCase):
+    """Chữ ký phải đổi khi BẤT KỲ thứ gì quyết định đầu vào của LLM đổi."""
+
+    def test_signature_tracks_prompt_and_context(self):
+        from annotation.label_audit import run as R
+        base = R._input_signature(R.SYSTEM_PROMPT)
+        self.assertNotEqual(base, R._input_signature(R.SYSTEM_PROMPT + " thêm luật"))
+        self.assertNotEqual(base, R._input_signature(R.DELETE_PROMPT))
+        original = R.CONTEXT_CHARS
+        try:
+            R.CONTEXT_CHARS = original + 80
+            self.assertNotEqual(
+                base, R._input_signature(R.SYSTEM_PROMPT),
+                "đổi cửa sổ context mà chữ ký không đổi — phán xử cũ sẽ bị tái dùng nhầm",
+            )
+        finally:
+            R.CONTEXT_CHARS = original
+        self.assertEqual(base, R._input_signature(R.SYSTEM_PROMPT))

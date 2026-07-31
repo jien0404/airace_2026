@@ -12,6 +12,7 @@ Không sửa gì vào nhãn gốc. Bản sửa nằm ở thư mục riêng, do l
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -24,7 +25,9 @@ from typing import Any
 
 from dataset_factory.schema import ASSERTION_TYPES
 
-from .screen import load_labeled_dir, screen_delete_candidates, screen_records
+from .screen import (
+    CONTEXT_CHARS, load_labeled_dir, screen_delete_candidates, screen_records,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SOURCES = {
@@ -32,10 +35,22 @@ SOURCES = {
     "gt2": "annotation/data/groundtruth_part2",
 }
 
-# Đổi số này mỗi khi SYSTEM_PROMPT đổi ý nghĩa. Verdict ghi bằng phiên bản khác sẽ bị hỏi lại
-# thay vì tái dùng — nếu không, mở prompt cho type/span xong vẫn đọc lại phán xử của prompt cũ
-# vốn bị cấm đụng tới type/span.
-PROMPT_VERSION = 2
+def _input_signature(prompt: str) -> str:
+    """Dấu vân tay của MỌI thứ quyết định đầu vào của LLM: prompt + cấu hình context.
+
+    Trước đây đây là một con số đếm tay, và nó đã hỏng đúng một lần: tôi nới cửa sổ 320→400 và
+    thêm heading nhưng quên tăng số, nên phán xử cũ (sinh với context khác hẳn) vẫn được tái dùng
+    im lặng. Băm tự động thì không quên được.
+    """
+    material = "\n".join([
+        prompt,
+        f"context_chars={CONTEXT_CHARS}",
+        f"heading_field={HEADING_IN_PAYLOAD}",
+    ])
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
+
+
+HEADING_IN_PAYLOAD = True
 
 DELETE_PROMPT = """Bạn soát lại QUYẾT ĐỊNH GÁN của nhãn NER y khoa tiếng Việt. Với mỗi entity đã
 được gán, hãy nói nó có thực sự đáng là entity hay không.
@@ -252,16 +267,18 @@ def adjudicate(
     client = client.with_options(timeout=timeout, max_retries=0)
     out_dir.mkdir(parents=True, exist_ok=True)
     journal_path = out_dir / ("verdicts_delete.jsonl" if mode == "delete" else "verdicts.jsonl")
+    signature = _input_signature(DELETE_PROMPT if mode == "delete" else SYSTEM_PROMPT)
+    journal = _read_jsonl(journal_path)
     verdicts: dict[str, dict[str, Any]] = {
-        row["id"]: row for row in _read_jsonl(journal_path)
-        if row.get("prompt_version") == PROMPT_VERSION
+        row["id"]: row for row in journal if row.get("input_signature") == signature
     }
-    stale = sum(
-        1 for row in _read_jsonl(journal_path)
-        if row.get("prompt_version") != PROMPT_VERSION
-    )
+    stale = len(journal) - len(verdicts)
     if stale:
-        print(f"[plan] bỏ qua {stale} phán xử của phiên bản prompt cũ", flush=True)
+        print(
+            f"[plan] bỏ qua {stale} phán xử sinh với prompt/context khác "
+            f"(chữ ký hiện tại {signature})",
+            flush=True,
+        )
     pending = [
         finding for finding in findings
         if not finding["mechanical"] and finding_id(finding) not in verdicts
@@ -305,7 +322,7 @@ def adjudicate(
                             "verdict": "delete" if row.get("verdict") == "delete" else "keep",
                             "reason": str(row.get("reason") or "")[:400],
                             "model": model,
-                            "prompt_version": PROMPT_VERSION,
+                            "input_signature": signature,
                         })
                         continue
                     fresh.append({
@@ -319,7 +336,7 @@ def adjudicate(
                         "span": (row.get("span") or "").strip() or None,
                         "reason": str(row.get("reason") or "")[:400],
                         "model": model,
-                        "prompt_version": PROMPT_VERSION,
+                        "input_signature": signature,
                     })
                 with lock:
                     for row in fresh:
