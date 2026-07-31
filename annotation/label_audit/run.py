@@ -346,10 +346,12 @@ def adjudicate(
                             stream.write(json.dumps(row, ensure_ascii=False) + "\n")
                         stream.flush()
                         os.fsync(stream.fileno())
-                fixes = sum(1 for row in fresh if row["verdict"] == "fix")
+                wanted = "delete" if mode == "delete" else "fix"
+                hits = sum(1 for row in fresh if row["verdict"] == wanted)
+                label = "đề xuất xoá" if mode == "delete" else "đề xuất sửa"
                 print(
                     f"[{index:04d}/{len(batches):04d}] {len(fresh)}/{len(batch)} phán xử, "
-                    f"{fixes} đề xuất sửa",
+                    f"{hits} {label}",
                     flush=True,
                 )
                 return
