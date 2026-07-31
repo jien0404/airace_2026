@@ -311,5 +311,8 @@ class BatchV3RulesTest(unittest.TestCase):
             item.get("assertion_cue_style") for item in plan if item["assertions"]
         }
         self.assertTrue(styles)
-        self.assertEqual(styles - {name for name, _ in ASSERTION_CUE_STYLES}, set())
+        allowed = {
+            name for table in ASSERTION_CUE_STYLES.values() for name, _ in table
+        }
+        self.assertEqual(styles - allowed, set())
         self.assertGreater(len(styles), 1, "cue chỉ có một hình thức")

@@ -642,11 +642,23 @@ SELF_NEGATED_SURFACE = re.compile(r"^\s*(không|chưa|phủ nhận|ko)\b", re.IG
 # `isHistorical` phổ biến nhất là `tính -`, `áp -`, `phì -` — tức tiền sử suy từ MỤC GẠCH ĐẦU
 # DÒNG (`Tăng huyết áp - đã điều trị`), trong khi synthetic chỉ dạy `từng có`/`đã từng`/`tiền sử`.
 # 10 bigram phổ biến nhất của synthetic phủ 66% ca, của Part 3 chỉ 33%.
-ASSERTION_CUE_STYLES = (
-    ("prose", 0.45),
-    ("list_marker", 0.33),
-    ("column_field", 0.22),
-)
+# Đo trực tiếp trên Part 3, phân loại theo DÒNG chứa entity:
+#   isHistorical: mục gạch đầu dòng 78% · văn xuôi 13% · dòng `Tên trường: giá trị` 9%
+#   isNegated:    mục gạch đầu dòng 58% · văn xuôi 32% · dòng trường 10%
+#   isFamily:     mục gạch đầu dòng 67% · văn xuôi 22% · dòng trường 11%
+# Casebook hiện tại dạy 100% văn xuôi (31/32 case chỉ có một dòng), nên generator chưa bao giờ
+# thấy hình thức chiếm đa số ngoài thực tế.
+ASSERTION_CUE_STYLES = {
+    "isHistorical": (("list_marker", 0.72), ("prose", 0.16), ("column_field", 0.12)),
+    "isNegated": (("list_marker", 0.55), ("prose", 0.32), ("column_field", 0.13)),
+    "isFamily": (("list_marker", 0.62), ("prose", 0.24), ("column_field", 0.14)),
+}
+
+
+def _cue_style(rng: Any, assertion_name: str) -> str:
+    table = ASSERTION_CUE_STYLES.get(assertion_name) or ASSERTION_CUE_STYLES["isNegated"]
+    names, weights = zip(*table)
+    return rng.choices(names, weights=weights, k=1)[0]
 
 
 def _assign_supplement_assertions(
@@ -687,8 +699,7 @@ def _assign_supplement_assertions(
             # kiểu `không có Không dung nạp thức ăn` — 42 ca trong mẻ 5.000.
             continue
         item["assertions"] = [name]
-        styles, style_weights = zip(*ASSERTION_CUE_STYLES)
-        item["assertion_cue_style"] = rng.choices(styles, weights=style_weights, k=1)[0]
+        item["assertion_cue_style"] = _cue_style(rng, name)
 
 
 # Ngưỡng bố cục tối thiểu (bộ test đo được 31 dòng, 50% dòng ngắn). Đặt dưới mức thật để vòng
