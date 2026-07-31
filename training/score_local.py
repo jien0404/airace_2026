@@ -169,11 +169,36 @@ def main() -> None:
     parser.add_argument("--gold-dir", help="thư mục labels gold")
     parser.add_argument("--gold-zip", help="zip labels gold (artifact bài nộp)")
     parser.add_argument("--out", help="ghi report ra file JSON")
+    parser.add_argument(
+        "--drop-surfaces",
+        help="file .txt, mỗi dòng một surface; bỏ chúng khỏi CẢ gold lẫn pred trước khi chấm. "
+             "Dùng để đo trên phần Part 3 KHÔNG bị synthetic nhiễm.",
+    )
     args = parser.parse_args()
     if bool(args.gold_dir) == bool(args.gold_zip):
         raise SystemExit("Chọn đúng một trong --gold-dir hoặc --gold-zip")
     gold = _load_dir(Path(args.gold_dir)) if args.gold_dir else _load_zip(Path(args.gold_zip))
-    report = score(gold, _load_dir(Path(args.pred)))
+    pred = _load_dir(Path(args.pred))
+    dropped = 0
+    if args.drop_surfaces:
+        blocked = {
+            line.strip().lower()
+            for line in Path(args.drop_surfaces).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+
+        def sieve(store):
+            nonlocal dropped
+            for name, rows in store.items():
+                keep = [r for r in rows if (r.get("text") or "").strip().lower() not in blocked]
+                dropped += len(rows) - len(keep)
+                store[name] = keep
+
+        sieve(gold)
+        sieve(pred)
+    report = score(gold, pred)
+    if args.drop_surfaces:
+        report["dropped_by_surface_filter"] = dropped
     text = json.dumps(report, ensure_ascii=False, indent=2)
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")
