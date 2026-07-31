@@ -286,17 +286,21 @@ def build(
     mask_synthetic_assertions: bool = False,
     validation_synthetic_records: int = 200,
     exclude: tuple[str, ...] = (),
+    use_fixed: bool = False,
 ) -> dict[str, Any]:
     stats: Counter = Counter()
     synthetic = load_synthetic(pilot_dir, stats, mask_synthetic_assertions)
+    # Bản đã rà bởi `annotation/label_audit`. Khi dùng bản này thì assertion của gt2 được MỞ:
+    # lý do mask trước đây là 3.036 nghi ngờ trên 15.444 entity, mà chính chúng vừa được sửa.
+    # Sau khi sửa, gt2 đạt assertion 16,8% (gold Part 3 16,6%) so với 10,7% của bản gốc.
+    gt2_root = _repo("annotation/data/label_fixed/gt2" if use_fixed else "annotation/data/groundtruth_part2")
+    part1_root = _repo("annotation/data/label_fixed/part1" if use_fixed else "annotation/data/best_54.92")
     gt2 = load_labeled_dir(
-        _repo("annotation/data/groundtruth_part2/notes"),
-        _repo("annotation/data/groundtruth_part2/labels"),
-        "gt2", mask_assertions=True, stats=stats,
+        gt2_root / "notes", gt2_root / "labels",
+        "gt2", mask_assertions=not use_fixed, stats=stats,
     )
     part1 = load_labeled_dir(
-        _repo("annotation/data/best_54.92/notes"),
-        _repo("annotation/data/best_54.92/labels"),
+        part1_root / "notes", part1_root / "labels",
         "part1", mask_assertions=False, stats=stats,
     )
     part3_notes = _repo("input_turn2")
@@ -372,6 +376,7 @@ def build(
             },
         },
         "excluded_from_train": list(exclude),
+        "labels": "label_fixed (đã rà)" if use_fixed else "gốc",
         "dropped_or_fixed": dict(stats),
         "splits": {name: describe(records) for name, records in splits.items()},
     }
@@ -387,6 +392,10 @@ def main() -> None:
     parser.add_argument("--out", default="datasets/ner_v2/track_a")
     parser.add_argument("--validation-documents", type=int, default=15)
     parser.add_argument("--seed", type=int, default=20260730)
+    parser.add_argument(
+        "--use-fixed", action="store_true",
+        help="Dùng nhãn đã rà ở annotation/data/label_fixed và MỞ assertion của gt2",
+    )
     parser.add_argument(
         "--exclude", default="",
         help="Bỏ nguồn khỏi TRAIN, ngăn cách bởi dấu phẩy: synthetic,gt2,part1",
@@ -404,6 +413,7 @@ def main() -> None:
         _repo(args.pilot), _repo(args.out), args.validation_documents, args.seed,
         args.mask_synthetic_assertions, args.validation_synthetic,
         tuple(name for name in args.exclude.split(',') if name.strip()),
+        args.use_fixed,
     )
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
 
