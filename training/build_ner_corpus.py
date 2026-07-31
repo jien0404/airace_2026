@@ -5,11 +5,19 @@ Phân vai (Track A — Part 3 KHÔNG bao giờ vào train):
 | split      | nguồn                                                    |
 |------------|----------------------------------------------------------|
 | train      | synthetic `dataset_factory` + gt2 (phần giữ lại) + part1 |
-| validation | gt2 giữ riêng theo tài liệu — dữ liệu THẬT, không synthetic |
+| validation | gt2 giữ riêng (NER) + lát synthetic giữ riêng (đo được assertion) |
 | test       | Part 3 (`input_turn2`) + nhãn artifact tốt nhất           |
 
-Assertion: chỉ part1 được coi là trusted. gt2 bị mask theo `configs/dataset_v1.json`, còn
-synthetic bị mask vì mẻ hiện tại chỉ có 0,5% entity mang assertion và có nhãn historical sai.
+Assertion: part1 và synthetic được coi là trusted, gt2 bị mask.
+
+- synthetic: mẻ v1 bị mask vì chỉ có 0,5% entity mang assertion. Mẻ v2 sinh theo spec mới đạt
+  19,5% (gold 16,6%), assertion phải có cue đỡ theo hai chế độ support/conflict và được auto-repair,
+  nên **đã mở supervision**. Không mở thì cả tập train chỉ còn part1 (2.726 entity) dạy assertion
+  và head assertion không học được gì — đo được `assertion_f1 = 0.0` ở lần train đầu.
+- gt2: `annotation/label_audit` đếm được 3.036 nghi ngờ trên 15.444 entity, trong đó 330 ca
+  KẾT_QUẢ_XÉT_NGHIỆM mang assertion là vi phạm luật tuyệt đối. Giữ mask cho tới khi bản sửa được
+  người duyệt.
+
 Entity bị mask mang `_assertion_supervision=false` nên `build_dataset_v2` không tính loss
 assertion trên chúng — head assertion không bị dạy sai trong lúc ta đo NER.
 
@@ -23,6 +31,7 @@ import argparse
 import hashlib
 import json
 import random
+import re
 import zipfile
 from collections import Counter
 from pathlib import Path
@@ -44,6 +53,56 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+GIANT_RUN = re.compile(r"\S{100,}")
+GIANT_RUN_KEEP = 30
+
+
+def collapse_giant_runs(
+    text: str, entities: list[dict[str, Any]], stats: Counter,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Rút gọn chuỗi không-khoảng-trắng dài bất thường, dời offset entity theo.
+
+    gt2 có 8 chuỗi rác kiểu `nông농농농…` dài tới 18.019 ký tự. `windowing_v2` tách từ theo khoảng
+    trắng nên cả chuỗi thành MỘT từ; tokenizer sinh 18.016 subword (cảnh báo `18016 > 512`), và
+    `train_v2` gặp từ dài quá `max_len` là `break` ngay — mọi từ phía sau trong cửa sổ đó mất
+    trắng. Không entity nào nằm trong các chuỗi này nên rút gọn là an toàn.
+    """
+    matches = [
+        match for match in GIANT_RUN.finditer(text)
+        if not any(
+            not (entity["position"][1] <= match.start() or entity["position"][0] >= match.end())
+            for entity in entities
+        )
+    ]
+    if not matches:
+        return text, entities
+    pieces: list[str] = []
+    shifts: list[tuple[int, int]] = []  # (vị trí gốc, tổng số ký tự đã bỏ tính tới đó)
+    cursor = removed = 0
+    for match in matches:
+        pieces.append(text[cursor:match.start()])
+        pieces.append(match.group()[:GIANT_RUN_KEEP])
+        removed += len(match.group()) - GIANT_RUN_KEEP
+        shifts.append((match.end(), removed))
+        cursor = match.end()
+        stats["sửa:rút gọn chuỗi rác dài"] += 1
+    pieces.append(text[cursor:])
+    new_text = "".join(pieces)
+
+    def shift(position: int) -> int:
+        delta = 0
+        for boundary, total in shifts:
+            if position >= boundary:
+                delta = total
+        return position - delta
+
+    moved = []
+    for entity in entities:
+        start, end = entity["position"]
+        moved.append({**entity, "position": [shift(start), shift(end)]})
+    return new_text, moved
 
 
 def clean_entities(
@@ -127,6 +186,7 @@ def load_labeled_dir(
             continue
         text = note_path.read_text(encoding="utf-8")
         entities = json.loads(label_path.read_text(encoding="utf-8"))
+        text, entities = collapse_giant_runs(text, entities, stats)
         records.append({
             "id": f"{source}:{note_path.stem}",
             "text": text,
@@ -163,7 +223,9 @@ def load_part3(notes_dir: Path, labels_zip: Path, stats: Counter) -> list[dict[s
     return records
 
 
-def load_synthetic(pilot_dir: Path, stats: Counter) -> list[dict[str, Any]]:
+def load_synthetic(
+    pilot_dir: Path, stats: Counter, mask_assertions: bool = False,
+) -> list[dict[str, Any]]:
     records = []
     drafts_path = pilot_dir / "drafts.jsonl"
     for line in drafts_path.read_text(encoding="utf-8").splitlines():
@@ -184,8 +246,9 @@ def load_synthetic(pilot_dir: Path, stats: Counter) -> list[dict[str, Any]]:
         records.append({
             "id": draft["draft_id"],
             "text": text,
-            # mask: mẻ synthetic hiện tại không đủ tin cậy về assertion
-            "entities": clean_entities(text, entities, mask_assertions=True, stats=stats),
+            "entities": clean_entities(
+                text, entities, mask_assertions=mask_assertions, stats=stats
+            ),
             "record_kind": "segment",
             "source": "synthetic_track_a",
             "genre": (draft.get("reference_case") or {}).get("genre", "unknown"),
@@ -220,9 +283,11 @@ def build(
     out_dir: Path,
     validation_documents: int,
     seed: int,
+    mask_synthetic_assertions: bool = False,
+    validation_synthetic_records: int = 200,
 ) -> dict[str, Any]:
     stats: Counter = Counter()
-    synthetic = load_synthetic(pilot_dir, stats)
+    synthetic = load_synthetic(pilot_dir, stats, mask_synthetic_assertions)
     gt2 = load_labeled_dir(
         _repo("annotation/data/groundtruth_part2/notes"),
         _repo("annotation/data/groundtruth_part2/labels"),
@@ -250,9 +315,17 @@ def build(
     validation = shuffled[:validation_documents]
     gt2_train = shuffled[validation_documents:]
 
+    # gt2 bị mask assertion, nên validation chỉ có gt2 thì assertion_f1 luôn = 0 dù model học được
+    # — đúng hiện tượng ở lần train đầu. Giữ riêng một lát synthetic (assertion trusted) để chỉ số
+    # assertion đo được thật và tham gia được vào `selection_score`.
+    synthetic_sorted = sorted(synthetic, key=lambda record: record["id"])
+    rng.shuffle(synthetic_sorted)
+    validation_synthetic = synthetic_sorted[:validation_synthetic_records]
+    synthetic_train = synthetic_sorted[validation_synthetic_records:]
+
     splits = {
-        "train": synthetic + gt2_train + part1,
-        "validation": validation,
+        "train": synthetic_train + gt2_train + part1,
+        "validation": validation + validation_synthetic,
         "test": test,
     }
     train_ids = {record["id"] for record in splits["train"]}
@@ -298,13 +371,22 @@ def build(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--pilot", default="datasets/pilots/train_trial_3000_a_v1")
-    parser.add_argument("--out", default="datasets/ner_v1/track_a")
+    parser.add_argument("--pilot", default="datasets/pilots/train_v2_5000_kept")
+    parser.add_argument("--out", default="datasets/ner_v2/track_a")
     parser.add_argument("--validation-documents", type=int, default=15)
     parser.add_argument("--seed", type=int, default=20260730)
+    parser.add_argument(
+        "--validation-synthetic", type=int, default=200,
+        help="Số bản ghi synthetic giữ riêng cho validation để đo được assertion",
+    )
+    parser.add_argument(
+        "--mask-synthetic-assertions", action="store_true",
+        help="Tắt supervision assertion của synthetic (mặc định BẬT từ mẻ v2)",
+    )
     args = parser.parse_args()
     manifest = build(
-        _repo(args.pilot), _repo(args.out), args.validation_documents, args.seed
+        _repo(args.pilot), _repo(args.out), args.validation_documents, args.seed,
+        args.mask_synthetic_assertions, args.validation_synthetic,
     )
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
 
