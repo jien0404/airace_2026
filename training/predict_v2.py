@@ -14,6 +14,21 @@ from .model_v2 import HybridNER
 from .windowing_v2 import sliding_windows
 
 
+def encoder_capacity(model) -> int:
+    """Số token TỐI ĐA encoder nhận được.
+
+    PhoBERT là RoBERTa: `position_ids = cumsum(mask) * mask + padding_idx`, nên chỉ số vị trí lớn
+    nhất là `padding_idx + seq_len`. Với `max_position_embeddings=258` và `pad_token_id=1`, chuỗi
+    dài quá 256 làm tra bảng position embedding ra ngoài biên — CUDA báo `device-side assert
+    triggered` ở tận lớp attention, không hề nhắc tới độ dài. Mặc định `--max-len 512` chạm đúng
+    bẫy này; train dùng 256 nên không lộ.
+    """
+    config = model.encoder.config
+    limit = int(getattr(config, "max_position_embeddings", 512))
+    padding = int(getattr(config, "pad_token_id", 0) or 0)
+    return limit - padding - 1
+
+
 def _encode_words(words, tokenizer, max_len, bos, eos, unk):
     input_ids = [bos]
     first, last = [], []
@@ -60,7 +75,7 @@ def predict_text(
     tokenizer,
     meta,
     device,
-    max_len=512,
+    max_len=256,
     max_words=180,
     overlap_words=45,
     type_threshold=0.60,
@@ -173,10 +188,13 @@ def predict_text(
 
 def main():
     parser = argparse.ArgumentParser(description="Inference hybrid NER v2")
-    parser.add_argument("--model-dir", required=True)
-    parser.add_argument("--input-dir", required=True)
-    parser.add_argument("--out-dir", required=True)
-    parser.add_argument("--max-len", type=int, default=512)
+    parser.add_argument("--model-dir", "--model", dest="model_dir", required=True)
+    parser.add_argument("--input-dir", "--input", dest="input_dir", required=True)
+    parser.add_argument("--out-dir", "--out", dest="out_dir", required=True)
+    parser.add_argument(
+        "--max-len", type=int, default=0,
+        help="0 = lấy theo lúc train, và luôn bị kẹp theo sức chứa của encoder",
+    )
     parser.add_argument("--max-words", type=int, default=180)
     parser.add_argument("--overlap-words", type=int, default=45)
     parser.add_argument("--type-threshold", type=float, default=0.60)
@@ -190,6 +208,11 @@ def main():
     except Exception:
         tokenizer = AutoTokenizer.from_pretrained(args.model_dir, use_fast=False)
     model, meta = HybridNER.load(args.model_dir, device)
+    capacity = encoder_capacity(model)
+    max_len = args.max_len or int(meta.get("max_len") or capacity)
+    if max_len > capacity:
+        print(f"[cảnh báo] max_len={max_len} vượt sức chứa encoder; hạ về {capacity}")
+        max_len = capacity
     os.makedirs(args.out_dir, exist_ok=True)
     files = sorted(
         glob.glob(os.path.join(args.input_dir, "*.txt")),
@@ -199,7 +222,7 @@ def main():
         text = Path(path).read_text(encoding="utf-8")
         entities = predict_text(
             text, model, tokenizer, meta, device,
-            args.max_len, args.max_words, args.overlap_words,
+            max_len, args.max_words, args.overlap_words,
             args.type_threshold, args.disagreement_threshold, args.assertion_threshold,
         )
         (Path(args.out_dir) / f"{Path(path).stem}.json").write_text(

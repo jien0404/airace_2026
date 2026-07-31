@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 from .model_v2 import HybridNER
+from .predict_v2 import encoder_capacity
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -255,6 +256,14 @@ def main():
         span_weight=args.span_weight,
         assertion_weight=args.assertion_weight,
     ).to(device)
+    capacity = encoder_capacity(model)
+    if args.max_len > capacity:
+        # Cùng cái bẫy như predict_v2: vượt sức chứa position embedding thì CUDA chỉ báo
+        # `device-side assert triggered`, không nói gì về độ dài.
+        raise SystemExit(
+            f"--max-len {args.max_len} vượt sức chứa của {args.model} ({capacity}); "
+            f"dùng --max-len {capacity} trở xuống"
+        )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     total_steps = max(1, int(len(train_loader) * args.epochs))
     scheduler = get_linear_schedule_with_warmup(
