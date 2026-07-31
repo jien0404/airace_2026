@@ -15,7 +15,7 @@ và KHÔNG nên dùng để chọn checkpoint.
 Dùng:
 
     python -m training.score_local --pred runs/.../pred_part3 \\
-        --gold-zip business_rules/artifacts/current/v66ab_*.zip --notes input_turn2
+        --notes input_turn2      # gold mặc định lấy artifact hiện hành trong MANIFEST
     python -m training.score_local --pred <dir> --gold-dir <dir labels>
 """
 
@@ -27,6 +27,8 @@ import zipfile
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
+
+from business_rules.artifacts import current_labels_zip
 
 from .schema_v2 import ASSERTIONS, TYPES
 
@@ -175,9 +177,13 @@ def main() -> None:
              "Dùng để đo trên phần Part 3 KHÔNG bị synthetic nhiễm.",
     )
     args = parser.parse_args()
-    if bool(args.gold_dir) == bool(args.gold_zip):
+    if args.gold_dir and args.gold_zip:
         raise SystemExit("Chọn đúng một trong --gold-dir hoặc --gold-zip")
-    gold = _load_dir(Path(args.gold_dir)) if args.gold_dir else _load_zip(Path(args.gold_zip))
+    if args.gold_dir:
+        gold = _load_dir(Path(args.gold_dir))
+    else:
+        # Không truyền gì thì lấy artifact hiện hành trong MANIFEST, khỏi ghi tên file bằng tay.
+        gold = _load_zip(Path(args.gold_zip) if args.gold_zip else current_labels_zip())
     pred = _load_dir(Path(args.pred))
     dropped = 0
     if args.drop_surfaces:

@@ -37,6 +37,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
+from business_rules.artifacts import current_labels_zip
+
 from .schema_v2 import ASSERTIONS, ASSERTION_TYPES, TYPES
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -57,6 +59,37 @@ def _sha256(path: Path) -> str:
 
 GIANT_RUN = re.compile(r"\S{100,}")
 GIANT_RUN_KEEP = 30
+
+LEADING_NEGATOR = re.compile(r"^(không|chưa|phủ nhận|ko)\s+", re.IGNORECASE)
+
+# Quy ước đo được trên CẢ BỐN nguồn: từ phủ định nằm NGOÀI span, entity mang `isNegated`.
+# 782 ca gold theo quy ước này (gt2 663, part1 72, part3 47) so với 2 ca ngược lại.
+#
+# Nhưng KHÔNG được cắt bừa: `không thể tự đứng dậy`, `không nhấc chân phải khỏi mặt giường`,
+# `chưa phát hiện bất thường` là gold part3 nguyên văn — ở đó phủ định CHÍNH LÀ phát hiện, cắt
+# ra thì span còn lại vô nghĩa. Phân biệt bằng bằng chứng chứ không bằng cảm tính: chỉ cắt khi
+# phần lõi tự nó đã là một entity đứng riêng trong gold ≥5 lần. Tập dưới đây là kết quả của
+# phép đo đó trên ner_v4 (8 surface ứng viên, đã loại `tự chủ đại tiện` vì gold part3 gán
+# `tiểu tiện không tự chủ` NGUYÊN CỤM — cắt nó là lật ngược nghĩa).
+#
+# Đo lại khi đổi corpus:
+#   python -m training.negation_span_audit --data datasets/ner_v4/track_a
+NEGATABLE_CORES = frozenset({"chướng", "ho", "ngủ", "nôn", "sốt", "đau", "đau đầu"})
+
+
+def strip_leading_negator(
+    surface: str, entity_type: str, assertions: list[str],
+) -> tuple[str, list[str]] | None:
+    """Cắt từ phủ định khỏi đầu span và gán `isNegated`, hoặc None nếu không đủ bằng chứng."""
+    if entity_type not in ASSERTION_TYPES:
+        return None
+    match = LEADING_NEGATOR.match(surface)
+    if not match:
+        return None
+    core = surface[match.end():]
+    if core.strip().lower() not in NEGATABLE_CORES:
+        return None
+    return core, sorted(set(assertions) | {"isNegated"})
 
 
 def collapse_giant_runs(
@@ -127,6 +160,15 @@ def clean_entities(
             start, end = start + offset, start + offset + len(trimmed)
             surface = trimmed
             stats["sửa:cắt khoảng trắng ở span"] += 1
+        forced: list[str] = []
+        stripped = strip_leading_negator(
+            surface, entity["type"], list(entity.get("assertions") or []),
+        )
+        if stripped is not None:
+            core, forced = stripped
+            start = end - len(core)
+            surface = core
+            stats["sửa:cắt từ phủ định khỏi span"] += 1
         if entity["type"] not in TYPES:
             stats["bỏ:type lạ"] += 1
             continue
@@ -142,7 +184,7 @@ def clean_entities(
             continue
         seen.add(key)
         assertions = [] if mask_assertions else [
-            name for name in entity.get("assertions") or [] if name in ASSERTIONS
+            name for name in (forced or entity.get("assertions") or []) if name in ASSERTIONS
         ]
         if assertions and entity["type"] not in ASSERTION_TYPES:
             assertions = []
@@ -304,10 +346,7 @@ def build(
         "part1", mask_assertions=False, stats=stats,
     )
     part3_notes = _repo("input_turn2")
-    part3_labels = _repo(
-        "business_rules/artifacts/current/"
-        "v66ab_hyperbilirubinemia_plus_alopecia_winners.zip"
-    )
+    part3_labels = current_labels_zip()
     test = load_part3(part3_notes, part3_labels, stats)
     if not test:
         raise RuntimeError("Không dựng được test Part 3; kiểm tra input_turn2 và artifact")
@@ -364,10 +403,13 @@ def build(
             "synthetic": {
                 "pilot": str(pilot_dir),
                 "drafts_sha256": _sha256(pilot_dir / "drafts.jsonl"),
-                "assertions": "masked_unreliable",
+                "assertions": "masked" if mask_synthetic_assertions else "trusted",
             },
-            "gt2": {"path": "annotation/data/groundtruth_part2", "assertions": "masked"},
-            "part1": {"path": "annotation/data/best_54.92", "assertions": "trusted"},
+            "gt2": {
+                "path": str(gt2_root.relative_to(REPO_ROOT)),
+                "assertions": "masked" if not use_fixed else "trusted",
+            },
+            "part1": {"path": str(part1_root.relative_to(REPO_ROOT)), "assertions": "trusted"},
             "part3_test": {
                 "notes": "input_turn2",
                 "labels": str(part3_labels.relative_to(REPO_ROOT)),

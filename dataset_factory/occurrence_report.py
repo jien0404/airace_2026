@@ -174,6 +174,12 @@ def warnings(rows: list[dict[str, Any]], summary: dict[str, Any], records: list[
             f"mixed_pct={summary['mixed_pct']}% quá thấp — dataset gần như không dạy "
             "occurrence gate (tham chiếu: gold ~20%, train nên 35-40%)"
         )
+    diversity = summary.get("surface_diversity") or {}
+    if diversity.get("singleton_pct", 100) < 25:
+        flags.append(
+            f"singleton_pct={diversity['singleton_pct']}% (Part 3: 56%) — từ vựng lặp quá nhiều, "
+            f"lặp trung bình {diversity.get('mean_reuse')}×; cân nhắc --surface-reuse-cap"
+        )
     if summary["groups_per_record"] < 0.5:
         flags.append(
             f"chỉ {summary['groups_per_record']} nhóm surface lặp/bản ghi — hầu như không có "
@@ -271,7 +277,35 @@ def report(records: list[dict[str, Any]]) -> dict[str, Any]:
         # suy ngược từ nhãn (surface không gán ở đâu cả thì analyse_record không thấy).
         summary["declared_omitted_roles"] = dict(declared)
         summary["covered_occurrences"] += declared.get("covered_by_longer", 0)
+    summary["surface_diversity"] = surface_diversity(records)
     return {"summary": summary, "warnings": warnings(rows, summary, records), "rows": rows}
+
+
+def surface_diversity(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Đa dạng từ vựng — đây là CẢNH BÁO, không phải quota.
+
+    Mẻ v3: 2.111 surface cho 39.777 ca, lặp 18,8×, singleton 0,1%. Part 3 gold: 1.179 surface cho
+    2.711 ca, singleton 56%. Đo được 323 ca gold (11,9%) có surface nằm sẵn trong kho mà mẻ v3
+    chưa bao giờ bốc — đó là phần `--surface-reuse-cap` mở ra.
+
+    `CANONICAL` §6: phân phối phải nảy ra từ luật gán và thể loại văn bản, không ép hậu kỳ. Nên
+    các số này chỉ để soi, không được dùng để lọc/bù draft sau khi sinh.
+    """
+    counts: Counter = Counter()
+    for record in records:
+        for entity in record.get("entities") or []:
+            counts[(entity["text"].strip().casefold(), entity["type"])] += 1
+    total = sum(counts.values())
+    if not counts:
+        return {"distinct_surfaces": 0, "mean_reuse": 0.0, "singleton_pct": 0.0}
+    return {
+        "distinct_surfaces": len(counts),
+        "mean_reuse": round(total / len(counts), 1),
+        "singleton_pct": round(
+            100 * sum(1 for value in counts.values() if value == 1) / len(counts), 1
+        ),
+        "part3_reference": {"distinct_surfaces": 1179, "mean_reuse": 2.3, "singleton_pct": 56.0},
+    }
 
 
 def main() -> None:

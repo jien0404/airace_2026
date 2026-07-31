@@ -18,6 +18,13 @@ Ba luật phủ quyết:
 3. **Không đổi type sang `TÊN_XÉT_NGHIỆM`/`KẾT_QUẢ_XÉT_NGHIỆM` nếu entity đang mang assertion**
    mà LLM lại không xoá assertion — mâu thuẫn nội tại, luật tuyệt đối bắt hai type này rỗng.
 
+4. **Không cắt từ phủ định khi phần còn lại vô nghĩa.** Cắt `không` khỏi span rồi gán `isNegated`
+   là đúng với đa số (`không sốt` → `sốt` + `isNegated`, khớp 2.093 ca gold), nhưng sai với hai
+   lớp: `không thể X` (đơn vị là `không thể`, cắt ra còn `thể X` vỡ ngữ pháp) và các cụm mà gold
+   Part 3 đã gán NGUYÊN CỤM với assertions rỗng vì sự bất lực chính là triệu chứng
+   (`không vững khi đứng`, `không nhấc chân phải khỏi mặt giường`). Đo trên lượt chạy đầu:
+   80/94 ca cắt đúng, 14 ca thuộc hai lớp này.
+
     python -m annotation.label_audit.postprocess --audit-dir annotation/data/label_audit
 """
 
@@ -25,21 +32,72 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import zipfile
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from business_rules.artifacts import current_labels_zip
 from dataset_factory.schema import ASSERTION_TYPES
 
 from .run import load_all_findings
 
 DELETABLE_TYPES = {"TRIỆU_CHỨNG"}
 
+LEADING_NEGATOR = re.compile(r"^(không|chưa|ko|phủ nhận)\s+", re.IGNORECASE)
+# `không thể` là MỘT đơn vị. Cắt riêng `không` ra khỏi `không thể vận động chi dưới` để lại
+# `thể vận động chi dưới` — vô nghĩa về ngữ pháp. `nên`/`còn` cùng kiểu.
+MODAL_REMNANT = re.compile(r"^(thể|nên|còn)\b", re.IGNORECASE)
+
+
+def _part3_whole_negated_surfaces() -> frozenset[str]:
+    """Cụm mở đầu bằng từ phủ định mà gold Part 3 gán NGUYÊN CỤM với assertions rỗng.
+
+    Đây là lớp "sự bất lực CHÍNH LÀ triệu chứng": `không thể tự đứng dậy`, `không vững khi đứng`,
+    `không nhấc chân phải khỏi mặt giường`. Gold đã phán trên đúng những surface này nên không
+    được cắt chúng — cắt ra thì phần còn lại mô tả người khoẻ mạnh, và gán thêm `isNegated` là
+    một assertion FP so với gold.
+    """
+    surfaces: set[str] = set()
+    with zipfile.ZipFile(current_labels_zip()) as archive:
+        for name in archive.namelist():
+            if not name.endswith(".json"):
+                continue
+            for entity in json.loads(archive.read(name)):
+                text = entity["text"].strip()
+                if LEADING_NEGATOR.match(text) and not entity.get("assertions"):
+                    surfaces.add(text.casefold())
+    return frozenset(surfaces)
+
+
+@lru_cache(maxsize=1)
+def part3_whole_negated_surfaces() -> frozenset[str]:
+    return _part3_whole_negated_surfaces()
+
 
 def veto(finding: dict[str, Any]) -> str | None:
     """Trả về lý do phủ quyết, hoặc None nếu đề xuất được giữ."""
     current_type = finding["current"]["type"]
     assertions = finding["current"]["assertions"]
+    proposed_text = finding.get("proposed_text")
+    if proposed_text:
+        original = (finding.get("entity") or {}).get("text") or finding.get(
+            "context", {}
+        ).get("surface", "")
+        match = LEADING_NEGATOR.match(original.strip())
+        if match and original.strip()[match.end():].strip() == proposed_text.strip():
+            if MODAL_REMNANT.match(proposed_text.strip()):
+                return (
+                    f"cắt {original.strip()!r} để lại {proposed_text.strip()!r} — "
+                    "`không thể` là một đơn vị, không tách được"
+                )
+            if original.strip().casefold() in part3_whole_negated_surfaces():
+                return (
+                    f"gold Part 3 gán {original.strip()!r} NGUYÊN CỤM với assertions rỗng — "
+                    "sự bất lực chính là triệu chứng"
+                )
     if finding.get("proposed_delete"):
         if current_type not in DELETABLE_TYPES:
             return f"chỉ được xoá TRIỆU_CHỨNG; đây là {current_type}"

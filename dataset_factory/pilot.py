@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import threading
@@ -28,6 +29,9 @@ from .config import REPO_ROOT, sha256_file
 from .llm_writer import azure_client
 from .schema import ASSERTIONS, ASSERTION_TYPES, TYPES
 from .sources import EntityCatalog, entity_allowed
+from .style_skeleton import DONOR_WEIGHTS as STYLE_DONOR_WEIGHTS
+from .style_skeleton import load_skeletons as load_style_lines
+from .style_skeleton import sample_lines as sample_style_lines
 
 MAX_PILOT_DRAFTS = 6_000
 MAX_VARIANTS_PER_CASE = 40
@@ -116,12 +120,22 @@ QUAN TRỌNG NHẤT — mỗi occurrence là một quyết định riêng:
 - Occurrence có `occurrence_role=repeat_labeled` là lần nhắc lại VẪN được gán, ở một ngữ cảnh
   bệnh nhân khác (mốc thời gian khác, mệnh đề khác). Hai lần này có thể mang assertion khác nhau.
 BỐ CỤC — bệnh án thật là DANH SÁCH VÀ BẢNG, không phải văn xuôi:
-- Đo được trên bộ test: 31 dòng/tài liệu, 50% số dòng ngắn hơn 40 ký tự. Draft phải giống vậy:
-  khoảng 25-35 dòng, và **45-60%** số dòng là dòng ngắn — đừng vụn hơn mức đó, vẫn phải có
-  đoạn văn xuôi cho bệnh sử và diễn biến.
+- `muc_tieu_bo_cuc` cho KÝ TỰ MỖI DÒNG và tỷ lệ dòng ngắn (dưới 40 ký tự) đo được trên hồ sơ
+  thật. Lấy độ dài bài chia cho `chars_per_line_median` để ra số dòng cần có — đừng dùng một con
+  số dòng cố định. Đừng vụn hơn mức đó, vẫn phải có đoạn văn xuôi cho bệnh sử và diễn biến.
 - Dùng thật sự các hình thức sau, không chỉ viết đoạn văn dài: heading ngắn đứng riêng một dòng;
   mục gạch đầu dòng `- ...`; dòng `Tên trường: giá trị`; bảng xét nghiệm mỗi chỉ số một dòng.
 - Câu văn xuôi vẫn được dùng cho bệnh sử và diễn biến, nhưng không được chiếm cả tài liệu.
+
+`dong_mau_bo_cuc` — các DÒNG RỜI lấy từ hồ sơ thật, đã xoá hết nội dung y khoa:
+- Đây là mẫu về HÌNH THỨC: cách xuống dòng, thụt lề, đặt heading, viết dòng trường-giá trị, và
+  đặc biệt là cách một mục gạch đầu dòng mang chú thời gian/trạng thái sau dấu gạch
+  (`- <CHẨN_ĐOÁN> - đã điều trị ổn`) — đó là hình thức cue assertion phổ biến nhất ngoài thực tế.
+- Các dòng này CỐ Ý lấy từ nhiều hồ sơ khác nhau và xáo trộn. Chúng KHÔNG phải một tài liệu, và
+  KHÔNG phải dàn ý. Đừng ghép chúng lại, đừng theo thứ tự của chúng, đừng viết lại chúng.
+- `<CHẨN_ĐOÁN>`, `<TRIỆU_CHỨNG>`, `<SỐ>`… trong dòng mẫu chỉ đánh dấu CHỖ ĐẶT. Tuyệt đối không
+  chép chúng vào bài, và cũng không chép nguyên văn câu chữ của dòng mẫu.
+- Nội dung bài viết chỉ đến từ `entity_contract` và `generation_brief`.
 
 CUE ASSERTION phải theo `assertion_cue_style` của từng entity, KHÔNG chỉ dùng cụm từ:
 - `prose` — cue bằng cụm từ trong câu: `từng có`, `đã điều trị`, `phủ nhận`, `mẹ bệnh nhân`.
@@ -173,6 +187,9 @@ Yêu cầu nội dung:
 - TÊN_XÉT_NGHIỆM và KẾT_QUẢ_XÉT_NGHIỆM luôn assertions=[].
 - Không gán các danh từ meta đứng riêng như "thuốc", "xét nghiệm", "triệu chứng", "chẩn đoán".
 - Không viết câu giải thích annotation như "đây chỉ là ví dụ/minh họa", "không cần gán nhãn".
+- KHÔNG mượn từ vựng của hướng dẫn này vào nội dung bài. Các chữ như `mục`, `section`, `scope`,
+  `bản ghi`, `draft`, `hợp đồng` là ngôn ngữ của yêu cầu, không phải của bệnh án. Bệnh nhân
+  "vào viện", "nhập viện", "tái khám" — không ai "vào mục" hay "nhập mục".
 - Không tự gán candidate ICD/RxNorm.
 
 Trả JSON duy nhất:
@@ -1626,7 +1643,7 @@ def build_generation_brief(
         common.pop("required_heading", None)
         common.update({
             "design": design,
-            "scope": "một mục/section hoàn chỉnh, không phải toàn tài liệu",
+            "scope": "viết trọn một phần của hồ sơ, không phải toàn bộ hồ sơ",
             "length_chars": [500, 950],
             "header_mode": mode,
             "heading_text": heading,
@@ -1635,7 +1652,7 @@ def build_generation_brief(
             ),
             "layout": (
                 common["layout"]
-                + "; mở rộng thành một mục tự nhiên, nhất quán chủ thể và timeline"
+                + "; viết thành một phần hồ sơ tự nhiên, nhất quán chủ thể và timeline"
             ),
             "surface_form": (
                 "đoạn văn tự nhiên"
@@ -1785,6 +1802,55 @@ def _approval(casebook: Path, approval_path: Path) -> dict[str, Any]:
     return approval
 
 
+def _read_style_lines(
+    directory: Path | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None, dict[str, Any] | None]:
+    """Đọc kho dòng mẫu ĐÃ DUYỆT và kiểm checksum.
+
+    `casebook/evidence_part3/README.md` quy định Track B chỉ được đọc tập few-shot đã phê duyệt
+    và có ghi checksum. Không có `SKELETON_APPROVAL.json` khớp thì từ chối chạy.
+    """
+    if directory is None:
+        return [], None, None
+    approval_path = directory / "SKELETON_APPROVAL.json"
+    if not approval_path.exists():
+        raise FileNotFoundError(
+            f"Thiếu {approval_path}. Chạy `python -m dataset_factory.style_skeleton approve "
+            f"--dir {directory}` trước."
+        )
+    approval = json.loads(approval_path.read_text(encoding="utf-8"))
+    lines = load_style_lines(directory)
+    digest = hashlib.sha256()
+    for row in sorted(lines, key=lambda item: item["line_id"]):
+        digest.update(f"{row['line_id']}:{row['sha256']}\n".encode("utf-8"))
+    if digest.hexdigest() != approval.get("skeleton_set_sha256"):
+        raise RuntimeError(
+            "Kho dòng mẫu đã đổi sau khi duyệt; chạy lại verify + approve thay vì dùng bản lệch."
+        )
+    report_path = directory / "build_report.json"
+    layout = None
+    if report_path.exists():
+        layout = json.loads(report_path.read_text(encoding="utf-8")).get("layout_target")
+    return lines, layout, approval
+
+
+def _style_block(
+    pool: list[dict[str, Any]],
+    layout: dict[str, Any] | None,
+    rng: random.Random,
+    count: int,
+) -> dict[str, Any]:
+    """Bốc dòng mẫu cho MỘT request. Ngẫu nhiên theo seed, không khớp thể loại."""
+    if not pool:
+        return {}
+    picked = sample_style_lines(pool, rng, count=count)
+    return {
+        "style_lines": [{"line_shape": row["line_shape"], "text": row["text"]} for row in picked],
+        "style_line_ids": [row["line_id"] for row in picked],
+        "layout_target": layout,
+    }
+
+
 def prepare(
     casebook: Path,
     approval_path: Path,
@@ -1797,6 +1863,9 @@ def prepare(
     entity_seed: int = DEFAULT_ENTITY_SEED,
     general_coverage_count: int = 0,
     resume: bool = False,
+    style_lines_dir: Path | None = None,
+    style_lines_per_request: int = 20,
+    surface_reuse_cap: int = 0,
 ) -> dict[str, Any]:
     if variants_per_case < 1 or variants_per_case > MAX_VARIANTS_PER_CASE:
         raise ValueError(f"variants-per-case phải trong [1,{MAX_VARIANTS_PER_CASE}]")
@@ -1827,10 +1896,18 @@ def prepare(
         )
     if track == "A" and evidence_path is not None:
         raise ValueError("Track A cấm exact evidence/few-shot Part 3")
-    if track in {"B", "C"} and evidence_path is None:
-        raise ValueError(f"Track {track} phải nhận --track-evidence tuyển chọn và có provenance")
+    if track == "A" and style_lines_dir is not None:
+        raise ValueError(
+            "Dòng mẫu bố cục trích từ Part 3 nên đây là mức tiếp xúc B; chạy với --track B"
+        )
+    if track in {"B", "C"} and evidence_path is None and style_lines_dir is None:
+        raise ValueError(
+            f"Track {track} phải nhận --track-evidence hoặc --style-lines đã duyệt và có checksum"
+        )
 
     evidence = _read_evidence(evidence_path) if evidence_path is not None else None
+    style_pool, style_layout, style_approval = _read_style_lines(style_lines_dir)
+    style_rng = random.Random(entity_seed ^ 0x5F1E)
     closed_contract_design = design in {
         "allowlist_section_v5", "full_document_v6", "occurrence_gate_v6",
     }
@@ -1838,7 +1915,9 @@ def prepare(
         track,
         entity_seed,
         max_tier=("A" if closed_contract_design else "B"),
+        reuse_cap=surface_reuse_cap,
     )
+    # `allow_vitals` để mặc định False: xem VITAL_SOURCE trong sources.py, O1 còn MỞ.
     requests = []
     for case_index, case in enumerate(selected):
         for variant in range(variants_per_case):
@@ -1858,6 +1937,7 @@ def prepare(
                 "case": materialize_case(case),
                 "generation_brief": brief,
                 **({"entity_contract": entity_contract} if entity_contract else {}),
+                **_style_block(style_pool, style_layout, style_rng, style_lines_per_request),
             })
     for coverage_index, case in enumerate(coverage_cases):
         # Broad coverage cũng luân phiên title / không heading / inline, thay vì
@@ -1875,6 +1955,7 @@ def prepare(
             "case": materialize_case(case),
             "generation_brief": brief,
             **({"entity_contract": entity_contract} if entity_contract else {}),
+            **_style_block(style_pool, style_layout, style_rng, style_lines_per_request),
         })
     # Requests là hàm thuần của (casebook, approval, tham số, seed) nên resume chỉ cần
     # so khớp nguyên văn: trùng thì giữ nguyên draft đã sinh, lệch thì dừng để không
@@ -1914,10 +1995,19 @@ def prepare(
         "casebook_sha256": sha256_file(casebook),
         "casebook_approval_path": str(approval_path),
         "casebook_approval_sha256": sha256_file(approval_path),
+        "part3_exposure": "B" if style_lines_dir or evidence_path else "A_independent",
+        "style_lines": None if style_approval is None else {
+            "dir": str(style_lines_dir),
+            "pool_lines": len(style_pool),
+            "per_request": style_lines_per_request,
+            "approval_sha256": style_approval["skeleton_set_sha256"],
+            "donor_weights": STYLE_DONOR_WEIGHTS,
+        },
         "request_count": len(requests),
         "case_count": len(selected),
         "general_coverage_count": len(coverage_cases),
         "variants_per_case": variants_per_case,
+        "surface_reuse_cap": surface_reuse_cap,
         "generation_design": design,
         "entity_seed": entity_seed if closed_contract_design else None,
         "entity_contract_policy": (
@@ -2206,6 +2296,56 @@ def _repair_assertions(
     return repairs, notes
 
 
+# Chuỗi từ liên tiếp trùng nguyên văn nguồn mà dài tới mức này thì coi là chép, không phải trùng
+# hợp ngẫu nhiên. Đo trên mẻ v3 (Track A, không donor): p90 chuỗi trùng dài nhất là 6 từ, cao
+# nhất 11 — nên 15 không phạt oan văn phong y khoa thông thường.
+MAX_COPIED_RUN_WORDS = 15
+
+
+@lru_cache(maxsize=1)
+def _source_word_grams() -> frozenset[tuple[str, ...]]:
+    """Mọi chuỗi `MAX_COPIED_RUN_WORDS` từ của part1/gt2/part3, dùng để bắt draft chép câu.
+
+    `Part3Firewall` chấm Jaccard toàn tài liệu — đủ để bắt bản sao cả bài, nhưng few-shot dạng
+    DÒNG thì rủi ro không phải chép cả bài mà là **chép lẻ một câu**. Đây mới là chốt đúng chỗ.
+    """
+    from .style_skeleton import WORD, load_sources
+
+    grams: set[tuple[str, ...]] = set()
+    for _, _, text, _ in load_sources():
+        words = [word.casefold() for word in WORD.findall(text)]
+        for index in range(max(0, len(words) - MAX_COPIED_RUN_WORDS + 1)):
+            grams.add(tuple(words[index:index + MAX_COPIED_RUN_WORDS]))
+    return frozenset(grams)
+
+
+def _copied_run(text: str, planned_surfaces: Iterable[str] = ()) -> str | None:
+    """Chuỗi framing bị chép, đã trừ surface entity đã lên kế hoạch.
+
+    Surface entity bốc từ từ điển — mà từ điển dựng từ chính part1/gt2/part3 — nên nó *đương
+    nhiên* trùng nguồn, nhất là narrative hình ảnh dài vốn là MỘT entity theo CANONICAL §3.5.
+    Không trừ chúng ra thì gate chặn oan 8,2% draft Track A chưa hề thấy donor. Thứ cần bắt là
+    phần khung câu bị chép, nên thay surface bằng dấu ngắt trước khi tính chuỗi.
+    """
+    from .style_skeleton import WORD
+
+    stripped = text
+    for surface in sorted(planned_surfaces, key=len, reverse=True):
+        if len(surface) >= 4:
+            stripped = stripped.replace(surface, "\x00")
+    words = [
+        word.casefold() for word in WORD.findall(stripped.replace("\x00", " \x00 "))
+    ]
+    grams = _source_word_grams()
+    for index in range(max(0, len(words) - MAX_COPIED_RUN_WORDS + 1)):
+        run = tuple(words[index:index + MAX_COPIED_RUN_WORDS])
+        if "\x00" in run:
+            continue
+        if run in grams:
+            return " ".join(run)
+    return None
+
+
 def _generated_errors(request: dict[str, Any], data: dict[str, Any]) -> tuple[list[str], dict]:
     errors: list[str] = []
     quality_flags: list[str] = []
@@ -2227,6 +2367,12 @@ def _generated_errors(request: dict[str, Any], data: dict[str, Any]) -> tuple[li
     if not isinstance(text, str) or not (20 <= len(text) <= 1500):
         errors.append("text phải dài 20-1500 ký tự")
         text = text if isinstance(text, str) else ""
+    if request.get("style_lines") and text:
+        copied = _copied_run(
+            text, [item["text"] for item in contract.get("entity_plan") or [] if item.get("text")]
+        )
+        if copied is not None:
+            errors.append(f"near_duplicate: chép {MAX_COPIED_RUN_WORDS} từ liên tiếp: {copied!r}")
     brief = request.get("generation_brief")
     document_format = data.get("document_format")
     section_path = data.get("section_path")
@@ -2691,6 +2837,8 @@ def generate(
                     "generation_brief": request.get("generation_brief"),
                     "entity_contract": request.get("entity_contract"),
                     "track_evidence": evidence,
+                    "dong_mau_bo_cuc": request.get("style_lines"),
+                    "muc_tieu_bo_cuc": request.get("layout_target"),
                 }
                 last_error = None
                 for _ in range(attempts):
@@ -3389,6 +3537,20 @@ def main(argv: list[str] | None = None) -> int:
         "--general-coverage-count", type=int, default=0,
         help="Số mẫu broad coverage không dùng casebook/Part 3; chỉ dùng entity contract",
     )
+    prepare_cmd.add_argument(
+        "--style-lines",
+        help="Kho DÒNG mẫu bố cục đã duyệt (dataset_factory.style_skeleton). Bắt buộc --track B "
+             "vì dòng trích từ Part 3.",
+    )
+    prepare_cmd.add_argument(
+        "--surface-reuse-cap", type=int, default=0,
+        help="Trần số lần một surface được bốc trong cả mẻ (0 = tắt). Mẻ v3 lặp 18,8×/surface "
+             "và bỏ sót 323 ca gold (11,9%%) có surface nằm sẵn trong kho mà chưa bao giờ bốc.",
+    )
+    prepare_cmd.add_argument(
+        "--style-lines-per-request", type=int, default=20,
+        help="Số dòng mẫu bốc ngẫu nhiên cho mỗi request; ép trải trên ≥8 hồ sơ khác nhau",
+    )
 
     generate_cmd = sub.add_parser("generate")
     generate_cmd.add_argument("--pilot", required=True)
@@ -3480,6 +3642,9 @@ def main(argv: list[str] | None = None) -> int:
             args.entity_seed,
             args.general_coverage_count,
             args.resume,
+            Path(args.style_lines).resolve() if args.style_lines else None,
+            args.style_lines_per_request,
+            args.surface_reuse_cap,
         )
     elif args.command == "generate":
         if not args.execute_llm:
