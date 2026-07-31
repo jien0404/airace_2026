@@ -128,9 +128,14 @@ BỐ CỤC — bệnh án thật là DANH SÁCH VÀ BẢNG, không phải văn x
 - Câu văn xuôi vẫn được dùng cho bệnh sử và diễn biến, nhưng không được chiếm cả tài liệu.
 
 `dong_mau_bo_cuc` — các DÒNG RỜI lấy từ hồ sơ thật, đã xoá hết nội dung y khoa:
-- Đây là mẫu về HÌNH THỨC: cách xuống dòng, thụt lề, đặt heading, viết dòng trường-giá trị, và
-  đặc biệt là cách một mục gạch đầu dòng mang chú thời gian/trạng thái sau dấu gạch
-  (`- <CHẨN_ĐOÁN> - đã điều trị ổn`) — đó là hình thức cue assertion phổ biến nhất ngoài thực tế.
+- Đây là mẫu về HÌNH THỨC: cách xuống dòng, thụt lề, đặt heading, viết dòng trường-giá trị, mục
+  gạch đầu dòng có phần chú sau dấu gạch.
+- ⚠ Phần chú sau dấu gạch là MỘT CUE ASSERTION THỰC SỰ, không phải trang trí. `- X - đã điều trị
+  ổn` nghĩa là X thuộc quá khứ. Vì vậy CHỈ được viết chú thời gian quá khứ (`đã điều trị`,
+  `đợt trước`, `từ trước`, `lần cũ`) cho occurrence mà `entity_plan` ghi `isHistorical`, và chú
+  phủ định cho occurrence ghi `isNegated`. Occurrence có `assertions: []` vẫn dùng được hình thức
+  mục gạch đầu dòng, nhưng phần chú phải nói về HIỆN TẠI (`- X - đang theo dõi`, `- X - mức độ
+  vừa`, `- X - xuất hiện hôm nay`) hoặc không có chú.
 - Các dòng này CỐ Ý lấy từ nhiều hồ sơ khác nhau và xáo trộn. Chúng KHÔNG phải một tài liệu, và
   KHÔNG phải dàn ý. Đừng ghép chúng lại, đừng theo thứ tự của chúng, đừng viết lại chúng.
 - `<CHẨN_ĐOÁN>`, `<TRIỆU_CHỨNG>`, `<SỐ>`… trong dòng mẫu chỉ đánh dấu CHỖ ĐẶT. Tuyệt đối không
@@ -302,6 +307,11 @@ CONFLICT_CUES: dict[str, tuple[str, ...]] = {
     "isHistorical": (
         "tiền sử", "trước đây", "đã từng", "từng bị", "từng mắc", "từng", "bệnh án cũ",
         "hồ sơ cũ",
+        # Các dạng dưới đây đo được trên smoke_v4b, ở phần chú sau dấu gạch của mục liệt kê —
+        # đúng hình thức cue isHistorical phổ biến nhất của Part 3 (78% ca). Thiếu chúng thì
+        # `- Sỏi niệu quản - đã xử trí trước đây` không được nhận là cue nào cả.
+        "đợt trước", "đợt cũ", "lần cũ", "lần trước", "lần khám trước", "bệnh án trước",
+        "từ trước", "đã điều trị", "đã xử trí",
     ),
 }
 # "từng" là cue tiền sử mạnh ("người bệnh từng đau ngực") nhưng cũng là lượng từ
@@ -374,9 +384,44 @@ def _cues_support(text: str, position: list[int]) -> set[str]:
     return found
 
 
-def _cues_before(text: str, start: int) -> set[str]:
+BULLET_NOTE = re.compile(r"^\s*[-•+*]\s*(?P<head>.+?)\s+[-–]\s+(?P<note>.+)$")
+
+
+def _bullet_note_after(text: str, start: int, end: int) -> str:
+    """Phần chú sau dấu gạch của một mục liệt kê, khi occurrence nằm ở vế trái.
+
+    `- Tăng huyết áp - đã điều trị ổn` là hình thức cue `isHistorical` PHỔ BIẾN NHẤT của Part 3
+    (78% ca), và cue nằm SAU occurrence. `_cues_before` chỉ quét phía trước nên mù hoàn toàn với
+    nó: smoke_v4b sinh 40 mục dạng này và **0/40** được gán `isHistorical`, tức dataset dạy ngược
+    CANONICAL §4.1. Hàm này mở đúng vùng đó cho bộ dò mâu thuẫn.
+    """
+    line_start = text.rfind("\n", 0, start) + 1
+    line_end = text.find("\n", start)
+    line_end = len(text) if line_end < 0 else line_end
+    match = BULLET_NOTE.match(text[line_start:line_end])
+    if not match:
+        return ""
+    head_end = line_start + match.end("head")
+    # Chỉ nhận khi occurrence nằm TRỌN trong vế trái; cue ở vế phải mới nói về nó.
+    if end > head_end:
+        return ""
+    # Chỉ lấy MỆNH ĐỀ ĐẦU của phần chú. Vế sau thường nói về diễn tiến chứ không về entity:
+    # `- Chuột rút - đã có từ trước, không còn liên tục` — `không` ở vế hai phủ định "liên tục",
+    # không phủ định chuột rút. Không cắt thì sinh ra `isNegated` sai, mà gỡ assertion sai đã đo
+    # được là nặng gấp 5 lần thêm assertion thiếu.
+    return re.split(r"[,;]", match.group("note"))[0].casefold()
+
+
+def _cues_before(text: str, start: int, end: int | None = None) -> set[str]:
     """Cue MÂU THUẪN: hẹp, phải sát occurrence, dùng để chặn nhãn rỗng đặt sai chỗ."""
     chunk = _clause_before(text, start, _CONFLICT_WINDOW, hard_only=True)
+    if end is not None:
+        # `_word_bounded_hits` đo khoảng cách từ CUỐI chuỗi — đúng cho cue đứng trước occurrence,
+        # nhưng trong phần chú thì cue nằm ở ĐẦU (`- X - đã điều trị trước đây, hiện theo dõi`).
+        # Cắt phần chú về đúng cửa sổ rồi mới nối, để phép đo khoảng cách vẫn có nghĩa.
+        note = _bullet_note_after(text, start, end)
+        if note:
+            chunk = f"{chunk} {note[:_CONFLICT_WINDOW]}"
     found = set()
     for name, cues in CONFLICT_CUES.items():
         for cue in cues:
@@ -2280,7 +2325,7 @@ def _repair_assertions(
             continue
         current = list(planned.get("assertions") or [])
         support = _cues_support(text, position)
-        conflict = _cues_before(text, position[0])
+        conflict = _cues_before(text, position[0], position[1])
         if typ == "THUỐC":
             conflict = conflict - {"isHistorical"}
         if "isFamily" in current:
