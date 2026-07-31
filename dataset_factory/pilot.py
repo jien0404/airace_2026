@@ -117,7 +117,8 @@ QUAN TRỌNG NHẤT — mỗi occurrence là một quyết định riêng:
   bệnh nhân khác (mốc thời gian khác, mệnh đề khác). Hai lần này có thể mang assertion khác nhau.
 BỐ CỤC — bệnh án thật là DANH SÁCH VÀ BẢNG, không phải văn xuôi:
 - Đo được trên bộ test: 31 dòng/tài liệu, 50% số dòng ngắn hơn 40 ký tự. Draft phải giống vậy:
-  tối thiểu 20 dòng, và ít nhất 40% số dòng là dòng ngắn.
+  khoảng 25-35 dòng, và **45-60%** số dòng là dòng ngắn — đừng vụn hơn mức đó, vẫn phải có
+  đoạn văn xuôi cho bệnh sử và diễn biến.
 - Dùng thật sự các hình thức sau, không chỉ viết đoạn văn dài: heading ngắn đứng riêng một dòng;
   mục gạch đầu dòng `- ...`; dòng `Tên trường: giá trị`; bảng xét nghiệm mỗi chỉ số một dòng.
 - Câu văn xuôi vẫn được dùng cho bệnh sử và diễn biến, nhưng không được chiếm cả tài liệu.
@@ -706,6 +707,8 @@ def _assign_supplement_assertions(
 # sửa chữa không phải viết lại quá nhiều draft, nhưng đủ để loại hẳn dạng văn xuôi thuần.
 MIN_LINES_PER_RECORD = 18
 MIN_SHORT_LINE_RATIO = 0.35
+# Chặn trên: mẻ thử v3 ra 71% dòng ngắn, Part 3 chỉ 50% — vụn quá cũng là sai khác phân phối.
+MAX_SHORT_LINE_RATIO = 0.66
 # Dưới ngưỡng này thì không xét bố cục — trích đoạn ngắn không nói được gì về layout.
 LAYOUT_CHECK_MIN_CHARS = 600
 
@@ -723,8 +726,15 @@ DENSITY_BUCKETS = (
         "TRIỆU_CHỨNG": 0.22, "CHẨN_ĐOÁN": 0.38, "TÊN_XÉT_NGHIỆM": 0.06,
         "KẾT_QUẢ_XÉT_NGHIỆM": 0.19, "THUỐC": 0.15,
     }, 0.10),
-    ("normal", (11, 16), 0.44, None, 0.22),
-    ("dense", (17, 25), 0.24, None, 0.28),
+    ("normal", (11, 16), 0.44, {
+        "TRIỆU_CHỨNG": 0.38, "CHẨN_ĐOÁN": 0.25, "TÊN_XÉT_NGHIỆM": 0.06,
+        "KẾT_QUẢ_XÉT_NGHIỆM": 0.17, "THUỐC": 0.14,
+    }, 0.22),
+    # Lớp tài liệu dày của Part 3 (73 file trùng Part 1) đo được TRIỆU_CHỨNG 43% / CHẨN_ĐOÁN 23%.
+    ("dense", (17, 25), 0.24, {
+        "TRIỆU_CHỨNG": 0.44, "CHẨN_ĐOÁN": 0.22, "TÊN_XÉT_NGHIỆM": 0.05,
+        "KẾT_QUẢ_XÉT_NGHIỆM": 0.16, "THUỐC": 0.13,
+    }, 0.28),
 )
 # Bản ghi hoàn toàn không có nhãn: spec §8.1 yêu cầu có, gold cũng có file gần như trống.
 EMPTY_RECORD_RATE = 0.06
@@ -997,7 +1007,7 @@ def build_entity_contract(
         gate_design
         and "KẾT_QUẢ_XÉT_NGHIỆM" in type_mix
         and target_mentions - len(plan) >= 2
-        and catalog.rng.random() < 0.85
+        and catalog.rng.random() < 0.68
     ):
         pair = catalog.sample_lab_pair("ket_qua")
         # Vế phải kiểu "15" hoặc "2" là số trần: word-bounded match sẽ đụng mọi con số khác
@@ -2240,7 +2250,9 @@ def _generated_errors(request: dict[str, Any], data: dict[str, Any]) -> tuple[li
                 f"(tối thiểu {required_lines}), {short_ratio:.0%} dòng ngắn "
                 f"(tối thiểu {MIN_SHORT_LINE_RATIO:.0%}) — bệnh án thật là danh sách và bảng"
             )
-        elif len(text) >= LAYOUT_CHECK_MIN_CHARS and (len(lines) < 24 or short_ratio < 0.45):
+        elif len(text) >= LAYOUT_CHECK_MIN_CHARS and not (
+            24 <= len(lines) and 0.42 <= short_ratio <= MAX_SHORT_LINE_RATIO
+        ):
             quality_flags.append(f"layout lines={len(lines)} short={short_ratio:.0%}")
         lowered = text.casefold()
         for pattern in META_TEXT_PATTERNS:
