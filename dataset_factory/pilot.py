@@ -293,6 +293,9 @@ ASSERTION_CUES: dict[str, tuple[str, ...]] = {
         "từng được", "từng mắc", "từng có", "từng", "trong quá khứ", "bệnh án cũ",
         "hồ sơ cũ", "nhiều năm trước", "cách đây", "hồi", "lúc nhỏ", "đợt trước",
         "năm ngoái", "đã điều trị ổn định", "trong quá trình theo dõi trước",
+        # Dạng rút gọn thường gặp trong phần chú của mục liệt kê (`- X - đã điều trị ổn`).
+        "đã điều trị", "đã xử trí", "từ trước", "đợt cũ", "lần cũ", "lần trước",
+        "lần khám trước", "bệnh án trước", "đã ghi nhận trước",
     ),
     "isFamily": (
         "bố", "mẹ", "cha", "ba", "má", "ông", "bà", "anh trai", "chị gái", "em trai",
@@ -366,6 +369,11 @@ def _cues_support(text: str, position: list[int]) -> set[str]:
     before = _clause_before(text, start, _SUPPORT_WINDOW_BEFORE, hard_only=False)
     after = text[end:end + _SUPPORT_WINDOW_AFTER].casefold()
     after = re.split(r"[.!?\n]", after)[0]
+    # Phần chú sau dấu gạch của mục liệt kê nói về chính occurrence ở vế trái, nên nó là bằng
+    # chứng đầy đủ cho MỌI loại assertion — không riêng isNegated. Thiếu vế này thì
+    # `- Tăng huyết áp - đã điều trị ổn` (hình thức isHistorical phổ biến nhất của Part 3) bị
+    # validator đánh trượt, và smoke_v4c trượt 20,3% draft vì đúng lý do đó.
+    note = _bullet_note_after(text, start, end)
     found = set()
     for name, cues in ASSERTION_CUES.items():
         for cue in cues:
@@ -373,8 +381,10 @@ def _cues_support(text: str, position: list[int]) -> set[str]:
                 found.add(name)
                 break
         else:
+            if note and any(_word_bounded_hits(note, cue, None) for cue in cues):
+                found.add(name)
             # Phủ định tiếng Việt có thể đứng SAU concept: "sốt không có", "ho: không".
-            if name == "isNegated" and any(
+            elif name == "isNegated" and any(
                 _word_bounded_hits(after, cue, None)
                 for cue in ("không", "chưa", "âm tính")
             ):
