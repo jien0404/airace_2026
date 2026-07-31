@@ -285,6 +285,7 @@ def build(
     seed: int,
     mask_synthetic_assertions: bool = False,
     validation_synthetic_records: int = 200,
+    exclude: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     stats: Counter = Counter()
     synthetic = load_synthetic(pilot_dir, stats, mask_synthetic_assertions)
@@ -323,8 +324,18 @@ def build(
     validation_synthetic = synthetic_sorted[:validation_synthetic_records]
     synthetic_train = synthetic_sorted[validation_synthetic_records:]
 
+    # Ablation nguồn: gt2 chiếm 53,6% khối lượng lấy mẫu nhưng phân bố type lệch hẳn so với
+    # Part 3 (TRIỆU_CHỨNG 67% vs 39%), nên cần đo được phương án bỏ/giữ nó.
+    train_by_source = {
+        "synthetic": synthetic_train, "gt2": gt2_train, "part1": part1,
+    }
+    for name in exclude:
+        if name not in train_by_source:
+            raise RuntimeError(f"--exclude {name!r} không phải nguồn train hợp lệ")
+        train_by_source[name] = []
+
     splits = {
-        "train": synthetic_train + gt2_train + part1,
+        "train": train_by_source["synthetic"] + train_by_source["gt2"] + train_by_source["part1"],
         "validation": validation + validation_synthetic,
         "test": test,
     }
@@ -360,6 +371,7 @@ def build(
                 "note": "nhãn bài nộp tốt nhất, KHÔNG phải gold do ban tổ chức công bố",
             },
         },
+        "excluded_from_train": list(exclude),
         "dropped_or_fixed": dict(stats),
         "splits": {name: describe(records) for name, records in splits.items()},
     }
@@ -376,6 +388,10 @@ def main() -> None:
     parser.add_argument("--validation-documents", type=int, default=15)
     parser.add_argument("--seed", type=int, default=20260730)
     parser.add_argument(
+        "--exclude", default="",
+        help="Bỏ nguồn khỏi TRAIN, ngăn cách bởi dấu phẩy: synthetic,gt2,part1",
+    )
+    parser.add_argument(
         "--validation-synthetic", type=int, default=200,
         help="Số bản ghi synthetic giữ riêng cho validation để đo được assertion",
     )
@@ -387,6 +403,7 @@ def main() -> None:
     manifest = build(
         _repo(args.pilot), _repo(args.out), args.validation_documents, args.seed,
         args.mask_synthetic_assertions, args.validation_synthetic,
+        tuple(name for name in args.exclude.split(',') if name.strip()),
     )
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
 

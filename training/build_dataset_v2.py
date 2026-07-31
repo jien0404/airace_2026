@@ -97,6 +97,7 @@ def build_track(
     o_keep: float,
     standalone_ratio: float,
     seed: int,
+    gold_mass: float = 0.5,
 ) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "labels.txt").write_text("\n".join(LABELS), encoding="utf-8")
@@ -121,7 +122,7 @@ def build_track(
                 index for index, row in enumerate(windows)
                 if row["record_kind"] == "document"
             ]
-            synthetic_mass = 0.5
+            synthetic_mass = 1.0 - gold_mass
             for indexes, mass in (
                 (segment_indexes, synthetic_mass * standalone_ratio),
                 (document_indexes, synthetic_mass * (1.0 - standalone_ratio)),
@@ -140,8 +141,8 @@ def build_track(
             ]
             # C: Part 3 đúng 25% sampling mass; independent gold 25%; synthetic 50%.
             # A/B không có direct Part 3 nên independent gold nhận trọn 50%.
-            direct_mass = 0.25 if direct_part3_indexes else 0.0
-            independent_mass = 0.5 - direct_mass
+            direct_mass = gold_mass / 2 if direct_part3_indexes else 0.0
+            independent_mass = gold_mass - direct_mass
             for indexes, mass in (
                 (independent_gold_indexes, independent_mass),
                 (direct_part3_indexes, direct_mass),
@@ -177,6 +178,11 @@ def main():
     parser.add_argument("--header-dropout", type=float, default=0.35)
     parser.add_argument("--o-keep", type=float, default=0.35)
     parser.add_argument("--standalone-ratio", type=float, default=0.60)
+    parser.add_argument(
+        "--gold-mass", type=float, default=0.5,
+        help="Tỷ lệ khối lượng lấy mẫu dành cho gold thật; phần còn lại cho synthetic. "
+             "Bỏ gt2 mà giữ 0.5 thì 249 cửa sổ part1 bị lặp ~14 lần mỗi epoch.",
+    )
     parser.add_argument("--seed", type=int, default=20260730)
     args = parser.parse_args()
     for track in [value.strip().upper() for value in args.tracks.split(",")]:
@@ -189,6 +195,7 @@ def main():
             args.o_keep,
             args.standalone_ratio,
             args.seed,
+            args.gold_mass,
         )
         print(
             f"[{track}] "
