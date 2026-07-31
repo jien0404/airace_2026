@@ -206,3 +206,66 @@ class InputSignatureTest(unittest.TestCase):
         finally:
             R.CONTEXT_CHARS = original
         self.assertEqual(base, R._input_signature(R.SYSTEM_PROMPT))
+
+
+class DeleteApplyTest(unittest.TestCase):
+    def test_delete_removes_entity_and_keeps_later_indexes_correct(self):
+        from annotation.label_audit import run as R
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); source = root / "src"
+            (source / "notes").mkdir(parents=True); (source / "labels").mkdir(parents=True)
+            text = "Bệnh nhân có triệu chứng ho khan và sốt cao."
+            (source / "notes" / "1.txt").write_text(text, encoding="utf-8")
+            ents = [
+                _entity("triệu chứng", text.index("triệu chứng"), "TRIỆU_CHỨNG"),
+                _entity("ho khan", text.index("ho khan"), "TRIỆU_CHỨNG"),
+                _entity("sốt cao", text.index("sốt cao"), "TRIỆU_CHỨNG"),
+            ]
+            (source / "labels" / "1.json").write_text(
+                json.dumps(ents, ensure_ascii=False), encoding="utf-8")
+            audit = root / "audit"; audit.mkdir()
+            base = {"file": "gt2:1", "source": "gt2", "mechanical": False, "rule": "r",
+                    "reason": "r", "context": {"before": "", "surface": "", "after": "",
+                                               "window_start": 0}}
+            # xoá entity index 0, đồng thời sửa assertion cho entity index 2
+            dele = {**base, "entity_index": 0, "kind": "should_not_be_labeled",
+                    "current": {"assertions": [], "type": "TRIỆU_CHỨNG"},
+                    "proposed_delete": True, "proposed_assertions": [], "entity": ents[0]}
+            fix = {**base, "entity_index": 2, "kind": "cue_without_assertion",
+                   "current": {"assertions": [], "type": "TRIỆU_CHỨNG"},
+                   "proposed_assertions": ["isNegated"], "entity": ents[2]}
+            (audit / "findings.jsonl").write_text(
+                json.dumps(fix, ensure_ascii=False) + "\n", encoding="utf-8")
+            (audit / "findings_delete.jsonl").write_text(
+                json.dumps(dele, ensure_ascii=False) + "\n", encoding="utf-8")
+            (audit / "decisions.json").write_text(json.dumps(
+                {finding_id(dele): "accept", finding_id(fix): "accept"}), encoding="utf-8")
+            original = dict(R.SOURCES); original_root = R.REPO_ROOT
+            try:
+                R.SOURCES.clear(); R.SOURCES["gt2"] = "src"; R.REPO_ROOT = root
+                apply_decisions(audit, root / "fixed")
+            finally:
+                R.SOURCES.clear(); R.SOURCES.update(original); R.REPO_ROOT = original_root
+            out = json.loads(
+                (root / "fixed" / "gt2" / "labels" / "1.json").read_text(encoding="utf-8"))
+            self.assertEqual([e["text"] for e in out], ["ho khan", "sốt cao"])
+            # entity index 2 vẫn được sửa đúng dù index 0 bị xoá
+            self.assertEqual(out[-1]["assertions"], ["isNegated"])
+            for entity in out:
+                self.assertEqual(
+                    text[entity["position"][0]:entity["position"][1]], entity["text"])
+
+    def test_delete_beats_fix_on_conflict(self):
+        from annotation.label_audit.run import load_all_findings
+        with tempfile.TemporaryDirectory() as temp:
+            audit = Path(temp)
+            row = {"file": "gt2:1", "entity_index": 5}
+            (audit / "findings.jsonl").write_text(
+                json.dumps({**row, "kind": "cue_without_assertion"}) + "\n", encoding="utf-8")
+            (audit / "findings_delete.jsonl").write_text(
+                json.dumps({**row, "kind": "should_not_be_labeled",
+                            "proposed_delete": True}) + "\n", encoding="utf-8")
+            merged = load_all_findings(audit)
+            self.assertEqual(len(merged), 1)
+            self.assertTrue(merged["gt2:1#5"]["proposed_delete"])
+            self.assertEqual(merged["gt2:1#5"]["supersedes_fix"], "cue_without_assertion")

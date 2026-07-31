@@ -22,13 +22,21 @@ AUDIT_DIR: Path | None = None
 
 
 def _findings() -> list[dict]:
-    path = AUDIT_DIR / "findings.jsonl"
-    if not path.exists():
-        return []
-    return [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
-    ]
+    """Gộp hai luồng; xoá thắng khi chồng lấn — cùng luật với `run.apply_decisions`."""
+    merged: dict[str, dict] = {}
+    for name in ("findings.jsonl", "findings_delete.jsonl"):
+        path = AUDIT_DIR / name
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            key = f"{row['file']}#{row['entity_index']}"
+            if name.endswith("_delete.jsonl") and key in merged:
+                row = {**row, "supersedes_fix": merged[key].get("kind")}
+            merged[key] = row
+    return list(merged.values())
 
 
 def _decisions_path() -> Path:
@@ -60,6 +68,8 @@ def api_findings():
             "current_type": finding["current"]["type"],
             "proposed_type": finding.get("proposed_type"),
             "proposed_span": finding.get("proposed_text"),
+            "delete": bool(finding.get("proposed_delete")),
+            "supersedes_fix": finding.get("supersedes_fix"),
             "screen_reason": finding["reason"],
             "llm_reason": (finding.get("llm") or {}).get("reason", ""),
             "context": finding["context"],
@@ -126,14 +136,18 @@ function draw(){
  document.getElementById('body').innerHTML=`
   <h2>${esc(f.surface)} <span class="badge">${f.type}</span></h2>
   <div class="mut">${f.file} · ${f.source} · ${f.kind}${f.mechanical?' · luật cơ học':''}</div>
-  ${row('assertion', JSON.stringify(f.current), JSON.stringify(f.proposed))}
+  ${f.delete ? `<div class="cmp"><div class="k">quyết định</div>
+     <div><span class="old">giữ nhãn</span></div><div>→</div>
+     <div><span class="new">XOÁ NHÃN NÀY</span></div></div>
+     ${f.supersedes_fix?`<div class="mut">đè lên đề xuất sửa loại <b>${esc(f.supersedes_fix)}</b></div>`:''}`
+   : row('assertion', JSON.stringify(f.current), JSON.stringify(f.proposed))}
   ${f.proposed_type ? row('type', f.current_type, f.proposed_type) : ''}
   ${f.proposed_span ? row('span', f.surface, f.proposed_span) : ''}
   <div class="mut"><b>Luật:</b> ${esc(f.rule)}</div>
   <div class="mut"><b>Sàng lọc:</b> ${esc(f.screen_reason)}</div>
   ${f.llm_reason?`<div class="mut"><b>LLM:</b> ${esc(f.llm_reason)}</div>`:''}
   <div class="ctx">${esc(f.context.before)}<mark>${esc(f.context.surface)}</mark>${esc(f.context.after)}</div>
-  <button class="ok" onclick="dec('accept')">Đồng ý sửa (A)</button>
+  <button class="ok" onclick="dec('accept')">${f.delete?'Đồng ý XOÁ (A)':'Đồng ý sửa (A)'}</button>
   <button class="no" onclick="dec('reject')">Giữ nguyên (G)</button>
   <button class="un" onclick="dec(null)">Bỏ quyết định</button>
   <div class="mut" style="margin-top:10px">Quyết định hiện tại: <b>${f.decision||'chưa'}</b></div>`;

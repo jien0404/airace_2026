@@ -429,10 +429,26 @@ def adjudicate(
     return report
 
 
+def load_all_findings(out_dir: Path) -> dict[str, dict[str, Any]]:
+    """Gộp hai luồng. XOÁ THẮNG khi một entity vừa bị đề xuất sửa vừa bị đề xuất xoá.
+
+    Sửa assertion cho một entity lẽ ra không nên tồn tại là việc vô nghĩa; và phán xử "đây không
+    phải entity" là phán xử cơ bản hơn phán xử "assertion của nó sai". Đo được 261 ca chồng lấn.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    for row in _read_jsonl(out_dir / "findings.jsonl"):
+        merged[row["file"] + "#" + str(row["entity_index"])] = row
+    for row in _read_jsonl(out_dir / "findings_delete.jsonl"):
+        key = row["file"] + "#" + str(row["entity_index"])
+        if key in merged:
+            row = {**row, "supersedes_fix": merged[key].get("kind")}
+        merged[key] = row
+    return merged
+
+
 def apply_decisions(out_dir: Path, fixed_root: Path) -> dict[str, Any]:
     """Ghi bản nhãn ĐÃ SỬA sang thư mục riêng; không đụng vào nhãn gốc."""
-    findings = {row["file"] + "#" + str(row["entity_index"]): row
-                for row in _read_jsonl(out_dir / "findings.jsonl")}
+    findings = load_all_findings(out_dir)
     decisions = json.loads((out_dir / "decisions.json").read_text(encoding="utf-8"))
     accepted = {key for key, value in decisions.items() if value == "accept"}
     if not accepted:
@@ -442,6 +458,8 @@ def apply_decisions(out_dir: Path, fixed_root: Path) -> dict[str, Any]:
         records = load_labeled_dir(REPO_ROOT / path, source)
         by_source[source] = {record["file_stem"]: record for record in records}
     changed = Counter()
+    # Xoá phải làm SAU cùng và theo chỉ số giảm dần, nếu không mọi entity phía sau bị lệch index.
+    to_delete: dict[tuple[str, str], list[int]] = {}
     for key in sorted(accepted):
         finding = findings.get(key)
         if finding is None:
@@ -449,6 +467,11 @@ def apply_decisions(out_dir: Path, fixed_root: Path) -> dict[str, Any]:
         source = finding["source"]
         stem = finding["file"].split(":", 1)[1]
         record = by_source[source][stem]
+        if finding.get("proposed_delete"):
+            to_delete.setdefault((source, stem), []).append(finding["entity_index"])
+            changed[f"{source}:xoá"] += 1
+            changed[source] += 1
+            continue
         entity = record["entities"][finding["entity_index"]]
         entity["assertions"] = list(finding["proposed_assertions"])
         if finding.get("proposed_type"):
@@ -463,6 +486,10 @@ def apply_decisions(out_dir: Path, fixed_root: Path) -> dict[str, Any]:
                 changed[f"{source}:span bị bỏ vì lệch offset"] += 1
                 continue
         changed[source] += 1
+    for (source, stem), indexes in to_delete.items():
+        entities = by_source[source][stem]["entities"]
+        for index in sorted(set(indexes), reverse=True):
+            del entities[index]
     fixed_root.mkdir(parents=True, exist_ok=True)
     manifest_files = {}
     for source, records in by_source.items():
