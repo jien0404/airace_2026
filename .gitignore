@@ -1,6 +1,7 @@
 # Local/private data and model artifacts
 medical_dataset/
 datasets/
+input/
 input_turn2/
 runs/
 *.zip
@@ -19,7 +20,17 @@ venv/
 annotation/data/
 annotation/scripts/
 dictionary/
+archives/
+backups/
+result/*/
+result/*.json
+result/*.txt
+business_rules/artifacts/current/
+business_rules/artifacts/archive/
+business_rules/artifacts/*.zip
 data_gen/_archive/generated_runs/
+data_gen/cache/
+data_gen/generated/
 training/old_dataset/
 training/ds*/
 training/dataset_v2*/
