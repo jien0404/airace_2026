@@ -21,7 +21,3 @@ python -m training.train_v2 --data datasets/ner_K_joint_windows_20260803/track_a
 python -m training.predict_v2 --model runs/part3_k_joint_30e_lr2e5/best \
   --input input_turn2 --out result/part3_k_joint_30e_lr2e5 \
   --assertion-policy part3 --assertion-aggregation selected
-
-unzip -q -o ner_K_wer_windows_20260803.zip -d datasets/ner_K_wer_windows_20260803/
-unzip -q -o ner_K_assertion_windows_20260803.zip -d datasets/ner_K_assertion_windows_20260803/
-unzip -q -o ner_K_joint_windows_20260803.zip -d datasets/ner_K_joint_windows_20260803/

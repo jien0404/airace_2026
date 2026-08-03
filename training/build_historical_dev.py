@@ -13,7 +13,7 @@ from .build_dataset_v2 import record_to_windows
 def build(pilot: Path, out: Path, *, max_words: int, overlap_words: int, seed: int) -> dict:
     checked = _pilot_gate(pilot)
     mode = checked["manifest"].get("mode")
-    if mode not in {"historical", "k_wer", "k_assertion"}:
+    if mode not in {"historical", "k_wer", "k_assertion", "l_assertion"}:
         raise RuntimeError(f"Pilot dev không phải targeted diagnostic mode: {pilot}")
     if checked["manifest"].get("direct_replay", 0):
         raise RuntimeError("Historical dev phải independent: direct_replay bắt buộc bằng 0")

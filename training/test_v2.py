@@ -7,8 +7,10 @@ import torch
 import torch.nn as nn
 
 from .build_dataset_v2 import record_to_windows
+from .audit_token_budget import audit_rows
 from .model_v2 import HybridNER
 from .train_assertion_head import _sampler_weights
+from .train_v2 import targeted_sampler_weights
 from .windowing_v2 import coverage_errors, sliding_windows, tokenize_raw
 
 
@@ -22,6 +24,14 @@ class DummyEncoder(nn.Module):
         return SimpleNamespace(last_hidden_state=self.embedding(input_ids))
 
 
+class DummyTokenizer:
+    unk_token_id = 99
+    pad_token_id = 0
+
+    def encode(self, token, add_special_tokens=False):
+        return [1, 2, 3] if token == "long" else [1]
+
+
 class TrainingV2Test(unittest.TestCase):
     def test_targeted_sampler_mass_is_explicit(self):
         rows = [
@@ -31,6 +41,34 @@ class TrainingV2Test(unittest.TestCase):
         weights = _sampler_weights(rows, "hist:", 0.10)
         self.assertAlmostEqual(sum(weights[:2]), 0.10)
         self.assertAlmostEqual(sum(weights[2:]), 0.90)
+
+    def test_targeted_sampler_control_and_multiple_profiles(self):
+        rows = [
+            {"record_id": "patch:type.1", "sample_weight": 2.0},
+            {"record_id": "patch:boundary.1", "sample_weight": 1.0},
+            {"record_id": "patch:fp.1", "sample_weight": 1.0},
+            {"record_id": "base:a", "sample_weight": 3.0},
+            {"record_id": "base:b", "sample_weight": 1.0},
+        ]
+        weights, report = targeted_sampler_weights(
+            rows,
+            regexes=(r"patch:(?:type|boundary)",),
+            targeted_mass=0.0,
+        )
+        self.assertEqual(weights[:2], [0.0, 0.0])
+        self.assertAlmostEqual(sum(weights[2:]), 1.0)
+        self.assertAlmostEqual(weights[3] / weights[4], 3.0)
+        self.assertEqual(report["targeted_windows"], 2)
+
+    def test_token_budget_audit_counts_truncation_and_clipped_span(self):
+        rows = [{
+            "id": "w1", "record_id": "r1", "tokens": ["a", "long", "b", "c"],
+            "n_prefix": 1,
+            "spans": [{"start": 2, "end": 4, "type_id": 1}],
+        }]
+        report = audit_rows(rows, DummyTokenizer(), max_len=6)
+        self.assertEqual(report["truncated_windows"], 1)
+        self.assertEqual(report["clipped_labeled_spans"], 1)
 
     def test_raw_offsets_and_overlap_coverage(self):
         text = "NFD a\u0300 và NFC à. " + " ".join(f"t{i}" for i in range(50))

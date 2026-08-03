@@ -5,6 +5,7 @@ import json
 import math
 import os
 import random
+import re
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +20,73 @@ from .predict_v2 import encoder_capacity
 
 def read_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.open(encoding="utf-8") if line.strip()]
+
+
+def targeted_sampler_weights(
+    rows: list[dict],
+    *,
+    prefixes: tuple[str, ...] = (),
+    regexes: tuple[str, ...] = (),
+    targeted_mass: float | None = None,
+) -> tuple[list[float], dict[str, float | int | list[str]]]:
+    """Override one targeted group's sampler mass while preserving within-group weights.
+
+    ``targeted_mass=0`` is intentional: it supplies a rehearsal control with exactly the same
+    corpus size/steps as a targeted run while never sampling the new records.
+    """
+    base = [float(row.get("sample_weight", 1.0)) for row in rows]
+    if not base or any(not math.isfinite(value) or value < 0 for value in base):
+        raise ValueError("sample_weight phải hữu hạn, không âm và corpus không được rỗng")
+    if targeted_mass is None:
+        return base, {
+            "override_enabled": False,
+            "targeted_windows": 0,
+            "other_windows": len(rows),
+            "targeted_mass": 0.0,
+            "other_mass": 1.0,
+            "prefixes": list(prefixes),
+            "regexes": list(regexes),
+        }
+    if not 0 <= targeted_mass < 1:
+        raise ValueError("--targeted-mass phải nằm trong [0,1)")
+    if not prefixes and not regexes:
+        raise ValueError("--targeted-mass cần ít nhất một --targeted-id-prefix/regex")
+    compiled = [re.compile(pattern) for pattern in regexes]
+    selected = []
+    for index, row in enumerate(rows):
+        record_id = str(row.get("record_id") or "")
+        if any(record_id.startswith(prefix) for prefix in prefixes) or any(
+            pattern.search(record_id) for pattern in compiled
+        ):
+            selected.append(index)
+    selected_set = set(selected)
+    other = [index for index in range(len(rows)) if index not in selected_set]
+    if not selected:
+        raise ValueError("Không tìm thấy targeted window theo selector đã truyền")
+    if not other:
+        raise ValueError("Corpus không còn window nền để rehearsal")
+
+    def distribute(indexes: list[int], mass: float) -> None:
+        source_sum = sum(base[index] for index in indexes)
+        if source_sum > 0:
+            for index in indexes:
+                output[index] = mass * base[index] / source_sum
+        else:
+            for index in indexes:
+                output[index] = mass / len(indexes)
+
+    output = [0.0] * len(rows)
+    distribute(selected, targeted_mass)
+    distribute(other, 1.0 - targeted_mass)
+    return output, {
+        "override_enabled": True,
+        "targeted_windows": len(selected),
+        "other_windows": len(other),
+        "targeted_mass": targeted_mass,
+        "other_mass": 1.0 - targeted_mass,
+        "prefixes": list(prefixes),
+        "regexes": list(regexes),
+    }
 
 
 class HybridDataset(Dataset):
@@ -161,8 +229,11 @@ def evaluate(model, loader, id_to_label, device):
                     continue
                 true_seq.append(id_to_label[label])
                 pred_seq.append(id_to_label[pred])
-            true_bio.append(true_seq)
-            pred_bio.append(pred_seq)
+            # seqeval raises ``Found input variables without list of list`` when a split only
+            # contains fully masked/prefix windows.  Such rows contain no evaluable BIO target.
+            if true_seq:
+                true_bio.append(true_seq)
+                pred_bio.append(pred_seq)
         valid_span = batch["span_labels"] > 0
         if valid_span.any():
             span_pred = result["span_logits"].argmax(-1)
@@ -174,11 +245,14 @@ def evaluate(model, loader, id_to_label, device):
             a_tp += int(((assertion_pred == 1) & (gold == 1) & mask).sum())
             a_fp += int(((assertion_pred == 1) & (gold == 0) & mask).sum())
             a_fn += int(((assertion_pred == 0) & (gold == 1) & mask).sum())
-    ner_f1 = f1_score(true_bio, pred_bio)
+    ner_f1 = f1_score(true_bio, pred_bio) if true_bio else 0.0
     precision = a_tp / max(1, a_tp + a_fp)
     recall = a_tp / max(1, a_tp + a_fn)
     assertion_f1 = 2 * precision * recall / max(1e-9, precision + recall)
-    report = classification_report(true_bio, pred_bio, output_dict=True, zero_division=0)
+    report = (
+        classification_report(true_bio, pred_bio, output_dict=True, zero_division=0)
+        if true_bio else {}
+    )
     return {
         "ner_f1": ner_f1,
         "per_type_f1": {
@@ -197,7 +271,11 @@ def evaluate(model, loader, id_to_label, device):
 def main():
     parser = argparse.ArgumentParser(description="Train hybrid BIO+span+assertion NER")
     parser.add_argument("--data-dir", "--data", dest="data_dir", required=True)
-    parser.add_argument("--model", required=True)
+    parser.add_argument("--model", help="Backbone Hugging Face; không cần khi warm-start")
+    parser.add_argument(
+        "--init-checkpoint",
+        help="Checkpoint HybridNER dùng để warm-start toàn bộ model thay vì khởi tạo backbone",
+    )
     parser.add_argument("--out", required=True)
     parser.add_argument("--epochs", type=float, default=5.0)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -209,8 +287,29 @@ def main():
     parser.add_argument("--assertion-weight", type=float, default=1.0)
     parser.add_argument("--negative-span-ratio", type=float, default=2.0)
     parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--grad-accumulation", type=int, default=1)
+    parser.add_argument(
+        "--targeted-id-prefix", action="append", default=[],
+        help="Có thể lặp; record_id khớp một prefix sẽ thuộc nhóm targeted",
+    )
+    parser.add_argument(
+        "--targeted-id-regex", action="append", default=[],
+        help="Có thể lặp; regex search trên record_id để tạo nhóm targeted",
+    )
+    parser.add_argument(
+        "--targeted-mass", type=float,
+        help="Khối lượng sampler của nhóm targeted; 0 tạo rehearsal control",
+    )
+    parser.add_argument(
+        "--save-every-epoch", action="store_true",
+        help="Lưu thêm epoch-XXX để phân tích warm-start, ngoài checkpoint best",
+    )
     parser.add_argument("--seed", type=int, default=20260730)
     args = parser.parse_args()
+    if not args.model and not args.init_checkpoint:
+        parser.error("cần --model hoặc --init-checkpoint")
+    if args.grad_accumulation < 1:
+        parser.error("--grad-accumulation phải >= 1")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -222,10 +321,11 @@ def main():
     labels = (data_dir / "labels.txt").read_text(encoding="utf-8").splitlines()
     label_to_id = {label: index for index, label in enumerate(labels)}
     id_to_label = {index: label for label, index in label_to_id.items()}
+    tokenizer_source = args.init_checkpoint or args.model
     try:
-        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=True)
     except Exception:
-        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
     train_rows = read_jsonl(data_dir / "train.jsonl")
     validation_rows = read_jsonl(data_dir / "validation.jsonl")
     test_rows = read_jsonl(data_dir / "test.jsonl")
@@ -238,8 +338,20 @@ def main():
     test_data = HybridDataset(
         test_rows, tokenizer, label_to_id, args.max_len, args.negative_span_ratio, seed=args.seed
     )
-    weights = [float(row.get("sample_weight", 1.0)) for row in train_rows]
-    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+    try:
+        weights, sampler_report = targeted_sampler_weights(
+            train_rows,
+            prefixes=tuple(args.targeted_id_prefix),
+            regexes=tuple(args.targeted_id_regex),
+            targeted_mass=args.targeted_mass,
+        )
+    except (ValueError, re.error) as error:
+        raise SystemExit(str(error)) from error
+    sampler_generator = torch.Generator()
+    sampler_generator.manual_seed(args.seed)
+    sampler = WeightedRandomSampler(
+        weights, num_samples=len(weights), replacement=True, generator=sampler_generator
+    )
     collator = lambda rows: collate(rows, train_data.pad)
     train_loader = DataLoader(
         train_data, batch_size=args.batch_size, sampler=sampler, collate_fn=collator
@@ -250,51 +362,102 @@ def main():
     test_loader = DataLoader(
         test_data, batch_size=args.eval_batch_size, shuffle=False, collate_fn=collator
     )
-    model = HybridNER(
-        args.model,
-        len(labels),
-        span_weight=args.span_weight,
-        assertion_weight=args.assertion_weight,
-    ).to(device)
+    types = (data_dir / "types.txt").read_text(encoding="utf-8").splitlines()
+    assertions = (data_dir / "assertions.txt").read_text(encoding="utf-8").splitlines()
+    if args.init_checkpoint:
+        model, init_meta = HybridNER.load(args.init_checkpoint, device)
+        for key, actual, expected in (
+            ("labels", list(init_meta["labels"]), labels),
+            ("types", list(init_meta["types"]), types),
+            ("assertions", list(init_meta["assertions"]), assertions),
+        ):
+            if actual != expected:
+                raise SystemExit(
+                    f"Schema {key} của checkpoint không khớp dataset: {actual!r} != {expected!r}"
+                )
+    else:
+        model = HybridNER(
+            args.model,
+            len(labels),
+            span_weight=args.span_weight,
+            assertion_weight=args.assertion_weight,
+        ).to(device)
     capacity = encoder_capacity(model)
     if args.max_len > capacity:
         # Cùng cái bẫy như predict_v2: vượt sức chứa position embedding thì CUDA chỉ báo
         # `device-side assert triggered`, không nói gì về độ dài.
         raise SystemExit(
-            f"--max-len {args.max_len} vượt sức chứa của {args.model} ({capacity}); "
+            f"--max-len {args.max_len} vượt sức chứa của {args.model or args.init_checkpoint} "
+            f"({capacity}); "
             f"dùng --max-len {capacity} trở xuống"
         )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    total_steps = max(1, int(len(train_loader) * args.epochs))
+    updates_per_epoch = math.ceil(len(train_loader) / args.grad_accumulation)
+    total_steps = max(1, int(updates_per_epoch * args.epochs))
     scheduler = get_linear_schedule_with_warmup(
         optimizer, int(total_steps * args.warmup), total_steps
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=args.fp16)
+    scaler = torch.amp.GradScaler("cuda", enabled=args.fp16 and device == "cuda")
     best = -1.0
     os.makedirs(args.out, exist_ok=True)
+    run_report = {
+        "schema_version": 1,
+        "data": str(data_dir.resolve()),
+        "init_checkpoint": str(Path(args.init_checkpoint).resolve()) if args.init_checkpoint else None,
+        "backbone": model.base_model,
+        "seed": args.seed,
+        "epochs": args.epochs,
+        "lr": args.lr,
+        "max_len": args.max_len,
+        "grad_accumulation": args.grad_accumulation,
+        "updates_per_epoch": updates_per_epoch,
+        "sampler": sampler_report,
+        "history": [],
+    }
+
+    def save_checkpoint(path: str, epoch: int, metrics: dict) -> None:
+        model.save(path, tokenizer, {
+            "labels": labels,
+            "types": types,
+            "assertions": assertions,
+            "max_len": args.max_len,
+            "init_checkpoint": run_report["init_checkpoint"],
+            "selected_epoch": epoch,
+            "selection_metrics": metrics,
+            "sampler": sampler_report,
+        })
+
     for epoch in range(int(math.ceil(args.epochs))):
         model.train()
-        for batch in train_loader:
+        optimizer.zero_grad(set_to_none=True)
+        for batch_index, batch in enumerate(train_loader):
             batch = {key: value.to(device) for key, value in batch.items()}
-            optimizer.zero_grad()
-            with torch.amp.autocast("cuda", enabled=args.fp16):
+            with torch.amp.autocast("cuda", enabled=args.fp16 and device == "cuda"):
                 result = model(**batch)
-            scaler.scale(result["loss"]).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+                loss = result["loss"] / args.grad_accumulation
+            scaler.scale(loss).backward()
+            should_step = (
+                (batch_index + 1) % args.grad_accumulation == 0
+                or batch_index + 1 == len(train_loader)
+            )
+            if should_step:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
         metrics = evaluate(model, validation_loader, id_to_label, device)
         print(f"[epoch {epoch + 1}] {json.dumps(metrics)}", flush=True)
+        run_report["history"].append({"epoch": epoch + 1, **metrics})
+        if args.save_every_epoch:
+            save_checkpoint(args.out + f"/epoch-{epoch + 1:03d}", epoch + 1, metrics)
         if metrics["selection_score"] > best:
             best = metrics["selection_score"]
-            model.save(args.out + "/best", tokenizer, {
-                "labels": labels,
-                "types": (data_dir / "types.txt").read_text(encoding="utf-8").splitlines(),
-                "assertions": (data_dir / "assertions.txt").read_text(encoding="utf-8").splitlines(),
-                "max_len": args.max_len,
-            })
+            save_checkpoint(args.out + "/best", epoch + 1, metrics)
+    (Path(args.out) / "training_report.json").write_text(
+        json.dumps(run_report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     best_model, meta = HybridNER.load(args.out + "/best", device)
     metrics = evaluate(best_model, test_loader, id_to_label, device)
     (Path(args.out) / "test_metrics.json").write_text(

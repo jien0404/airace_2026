@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from transformers import AutoTokenizer
 
 from .model_v2 import HybridNER
-from .train_v2 import HybridDataset, collate, read_jsonl
+from .train_v2 import HybridDataset, collate, read_jsonl, targeted_sampler_weights
 
 
 def _state_hash(module: torch.nn.Module) -> str:
@@ -34,20 +34,13 @@ def _focused_row_hash(model: HybridNER, index: int) -> str:
 
 
 def _sampler_weights(rows: list[dict], prefix: str, targeted_mass: float) -> list[float]:
-    targeted = [
-        index for index, row in enumerate(rows)
-        if prefix and str(row.get("record_id") or "").startswith(prefix)
-    ]
-    if not targeted:
-        raise RuntimeError(f"Không tìm thấy targeted window với record_id prefix={prefix!r}")
-    other = [index for index in range(len(rows)) if index not in set(targeted)]
-    if not other:
-        raise RuntimeError("Corpus assertion-head không còn window nền để chống overfit")
-    weights = [0.0] * len(rows)
-    for index in targeted:
-        weights[index] = targeted_mass / len(targeted)
-    for index in other:
-        weights[index] = (1.0 - targeted_mass) / len(other)
+    """Backward-compatible wrapper used by historical tests and old scripts."""
+    try:
+        weights, _ = targeted_sampler_weights(
+            rows, prefixes=(prefix,), targeted_mass=targeted_mass
+        )
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
     return weights
 
 
@@ -104,6 +97,10 @@ def main() -> None:
     parser.add_argument("--data", required=True, help="Window dataset track_a")
     parser.add_argument("--init-checkpoint", required=True, help="Checkpoint HybridNER baseline")
     parser.add_argument("--historical-dev", required=True, help="Window JSONL dev independent")
+    parser.add_argument(
+        "--public-dev",
+        help="Part 3 gán tay ở dạng window; mặc định dùng test.jsonl của dataset",
+    )
     parser.add_argument("--out", required=True)
     parser.add_argument("--focus", default="isHistorical")
     parser.add_argument("--targeted-id-prefix", required=True)
@@ -113,11 +110,18 @@ def main() -> None:
     parser.add_argument("--eval-batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--threshold", type=float, default=0.60)
+    parser.add_argument(
+        "--independent-dev-tolerance", type=float, default=0.01,
+        help="Mức giảm F1 tối đa trên dev độc lập khi chọn theo public dev",
+    )
+    parser.add_argument("--save-every-epoch", action="store_true")
     parser.add_argument("--seed", type=int, default=20260803)
     parser.add_argument("--fp16", action="store_true")
     args = parser.parse_args()
     if not 0 < args.targeted_mass < 1:
         raise SystemExit("--targeted-mass phải nằm trong (0,1)")
+    if not 0 <= args.independent_dev_tolerance <= 1:
+        raise SystemExit("--independent-dev-tolerance phải nằm trong [0,1]")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -139,11 +143,17 @@ def main() -> None:
     train_rows = read_jsonl(data_dir / "train.jsonl")
     validation_rows = read_jsonl(data_dir / "validation.jsonl")
     dev_rows = read_jsonl(Path(args.historical_dev))
-    if not train_rows or not validation_rows or not dev_rows:
-        raise SystemExit("Train/validation/historical-dev không được rỗng")
+    public_dev_path = Path(args.public_dev) if args.public_dev else data_dir / "test.jsonl"
+    public_dev_rows = read_jsonl(public_dev_path)
+    if not train_rows or not validation_rows or not dev_rows or not public_dev_rows:
+        raise SystemExit("Train/validation/historical-dev/public-dev không được rỗng")
 
     weights = _sampler_weights(train_rows, args.targeted_id_prefix, args.targeted_mass)
-    sampler = WeightedRandomSampler(weights, num_samples=len(train_rows), replacement=True)
+    sampler_generator = torch.Generator()
+    sampler_generator.manual_seed(args.seed)
+    sampler = WeightedRandomSampler(
+        weights, num_samples=len(train_rows), replacement=True, generator=sampler_generator
+    )
     train_loader = _loader(
         train_rows, tokenizer, label_to_id, max_len, args.batch_size, args.seed, sampler=sampler
     )
@@ -152,6 +162,9 @@ def main() -> None:
     )
     dev_loader = _loader(
         dev_rows, tokenizer, label_to_id, max_len, args.eval_batch_size, args.seed
+    )
+    public_dev_loader = _loader(
+        public_dev_rows, tokenizer, label_to_id, max_len, args.eval_batch_size, args.seed
     )
 
     for parameter in model.parameters():
@@ -175,8 +188,8 @@ def main() -> None:
     os.makedirs(args.out, exist_ok=True)
     history = []
 
-    def save_best(epoch: int, metrics: dict) -> None:
-        model.save(args.out + "/best", tokenizer, {
+    def save_checkpoint(path: str, epoch: int, metrics: dict) -> None:
+        model.save(path, tokenizer, {
             "labels": labels,
             "types": list(meta["types"]),
             "assertions": assertion_names,
@@ -190,9 +203,17 @@ def main() -> None:
 
     initial_dev = evaluate_focus(model, dev_loader, assertion_index, device, args.threshold)
     initial_val = evaluate_focus(model, validation_loader, assertion_index, device, args.threshold)
-    best_key = (initial_dev["f1"], initial_val["f1"])
-    save_best(0, {"historical_dev": initial_dev, "validation": initial_val})
-    history.append({"epoch": 0, "historical_dev": initial_dev, "validation": initial_val})
+    initial_public = evaluate_focus(
+        model, public_dev_loader, assertion_index, device, args.threshold
+    )
+    initial_metrics = {
+        "historical_dev": initial_dev,
+        "public_dev": initial_public,
+        "validation": initial_val,
+    }
+    best_key = (initial_public["f1"], initial_dev["f1"], initial_val["f1"])
+    save_checkpoint(args.out + "/best", 0, initial_metrics)
+    history.append({"epoch": 0, **initial_metrics, "eligible": True})
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -221,17 +242,28 @@ def main() -> None:
         validation_metrics = evaluate_focus(
             model, validation_loader, assertion_index, device, args.threshold
         )
+        public_metrics = evaluate_focus(
+            model, public_dev_loader, assertion_index, device, args.threshold
+        )
+        eligible = (
+            dev_metrics["f1"]
+            >= initial_dev["f1"] - args.independent_dev_tolerance
+        )
         row = {
             "epoch": epoch,
             "historical_dev": dev_metrics,
+            "public_dev": public_metrics,
             "validation": validation_metrics,
+            "eligible": eligible,
         }
         history.append(row)
         print(json.dumps(row, ensure_ascii=False), flush=True)
-        key = (dev_metrics["f1"], validation_metrics["f1"])
-        if key > best_key:
+        if args.save_every_epoch:
+            save_checkpoint(args.out + f"/epoch-{epoch:03d}", epoch, row)
+        key = (public_metrics["f1"], dev_metrics["f1"], validation_metrics["f1"])
+        if eligible and key > best_key:
             best_key = key
-            save_best(epoch, row)
+            save_checkpoint(args.out + "/best", epoch, row)
 
     frozen_after = {
         "encoder": _state_hash(model.encoder),
@@ -254,6 +286,9 @@ def main() -> None:
         ),
         "train_windows": len(train_rows),
         "historical_dev_windows": len(dev_rows),
+        "public_dev": str(public_dev_path.resolve()),
+        "public_dev_windows": len(public_dev_rows),
+        "independent_dev_tolerance": args.independent_dev_tolerance,
         "frozen_modules_unchanged": frozen_modules == frozen_after,
         "nonfocus_assertion_rows_unchanged": nonfocus_before == nonfocus_after,
         "focus_row_changed": focus_before != _focused_row_hash(model, assertion_index),
