@@ -321,7 +321,7 @@ def describe(records: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def build(
-    pilot_dir: Path,
+    pilot_dirs: list[Path],
     out_dir: Path,
     validation_documents: int,
     seed: int,
@@ -329,14 +329,33 @@ def build(
     validation_synthetic_records: int = 200,
     exclude: tuple[str, ...] = (),
     use_fixed: bool = False,
+    real_root: str | None = None,
+    validation_sources: tuple[str, ...] = ("gt2", "synthetic"),
+    validation_part1_documents: int = 15,
 ) -> dict[str, Any]:
     stats: Counter = Counter()
-    synthetic = load_synthetic(pilot_dir, stats, mask_synthetic_assertions)
+    # Nhiều pilot gộp lại: `id` của draft đã mang tiền tố mẻ nên không đụng nhau, và mỗi mẻ vào
+    # train nguyên khối. Gộp KHÔNG thêm từ vựng — cả bốn mẻ dùng chung đúng ~2.100 surface do bộ
+    # lọc `min_source_count=2` — nên đây là phép đo về KHỐI LƯỢNG và phong cách, không phải về
+    # đa dạng từ vựng.
+    synthetic = []
+    seen_ids: set[str] = set()
+    for pilot_dir in pilot_dirs:
+        for record in load_synthetic(pilot_dir, stats, mask_synthetic_assertions):
+            if record["id"] in seen_ids:
+                record["id"] = f"{pilot_dir.name}:{record['id']}"
+            seen_ids.add(record["id"])
+            synthetic.append(record)
     # Bản đã rà bởi `annotation/label_audit`. Khi dùng bản này thì assertion của gt2 được MỞ:
     # lý do mask trước đây là 3.036 nghi ngờ trên 15.444 entity, mà chính chúng vừa được sửa.
     # Sau khi sửa, gt2 đạt assertion 16,8% (gold Part 3 16,6%) so với 10,7% của bản gốc.
-    gt2_root = _repo("annotation/data/label_fixed/gt2" if use_fixed else "annotation/data/groundtruth_part2")
-    part1_root = _repo("annotation/data/label_fixed/part1" if use_fixed else "annotation/data/best_54.92")
+    # `--real-root` cho phép trỏ vào bản nhãn thật khác (vd `label_final` đã hậu xử lý) mà không
+    # phải ghi đè `label_fixed` — cần thiết để so hai bản nhãn trong cùng một lượt thử nghiệm.
+    if real_root:
+        gt2_root, part1_root = _repo(f"{real_root}/gt2"), _repo(f"{real_root}/part1")
+    else:
+        gt2_root = _repo("annotation/data/label_fixed/gt2" if use_fixed else "annotation/data/groundtruth_part2")
+        part1_root = _repo("annotation/data/label_fixed/part1" if use_fixed else "annotation/data/best_54.92")
     gt2 = load_labeled_dir(
         gt2_root / "notes", gt2_root / "labels",
         "gt2", mask_assertions=not use_fixed, stats=stats,
@@ -351,26 +370,52 @@ def build(
     if not test:
         raise RuntimeError("Không dựng được test Part 3; kiểm tra input_turn2 và artifact")
 
-    # Validation là tài liệu gt2 GIỮ RIÊNG: cùng phân phối thật với test, và không có
-    # document nào vừa ở train vừa ở validation.
+    # THÀNH PHẦN VALIDATION LÀ MỘT BIẾN, không phải hằng số.
+    #
+    # Mỗi lựa chọn có một khuyết điểm đã biết, và không có phương án nào đúng hiển nhiên:
+    #
+    # - chỉ `gt2`: cùng phân phối văn bản thật với test, nhưng khi gt2 bị mask assertion thì
+    #   `assertion_f1` luôn bằng 0 nên `selection_score` mù với một phần ba bài toán;
+    # - chỉ `synthetic`: đo được assertion, nhưng chọn checkpoint theo chính phân phối mình sinh
+    #   ra — model hợp với dữ liệu giả nhất chưa chắc hợp với Part 3 nhất;
+    # - có `part1`: nhãn thật, assertion trusted, nhưng `part1-part3-text-overlap` đo được 40,5%
+    #   văn bản Part 1 trùng Part 3, nên điểm validation sẽ lạc quan giả.
+    #
+    # Part 3 KHÔNG bao giờ được làm validation (`DATASET_CONTRACT` §7).
     rng = random.Random(seed)
-    shuffled = sorted(gt2, key=lambda record: record["id"])
-    rng.shuffle(shuffled)
-    validation = shuffled[:validation_documents]
-    gt2_train = shuffled[validation_documents:]
 
-    # gt2 bị mask assertion, nên validation chỉ có gt2 thì assertion_f1 luôn = 0 dù model học được
-    # — đúng hiện tượng ở lần train đầu. Giữ riêng một lát synthetic (assertion trusted) để chỉ số
-    # assertion đo được thật và tham gia được vào `selection_score`.
-    synthetic_sorted = sorted(synthetic, key=lambda record: record["id"])
-    rng.shuffle(synthetic_sorted)
-    validation_synthetic = synthetic_sorted[:validation_synthetic_records]
-    synthetic_train = synthetic_sorted[validation_synthetic_records:]
+    def hold_out(records: list[dict[str, Any]], count: int) -> tuple[list, list]:
+        ordered = sorted(records, key=lambda record: record["id"])
+        rng.shuffle(ordered)
+        return ordered[:count], ordered[count:]
+
+    unknown = set(validation_sources) - {"gt2", "synthetic", "part1"}
+    if unknown:
+        raise RuntimeError(f"--validation-sources không hợp lệ: {sorted(unknown)}")
+    if not validation_sources:
+        raise RuntimeError("validation không được rỗng")
+
+    validation: list[dict[str, Any]] = []
+    if "gt2" in validation_sources:
+        held, gt2_train = hold_out(gt2, validation_documents)
+        validation += held
+    else:
+        gt2_train = gt2
+    if "synthetic" in validation_sources:
+        held, synthetic_train = hold_out(synthetic, validation_synthetic_records)
+        validation += held
+    else:
+        synthetic_train = synthetic
+    if "part1" in validation_sources:
+        held, part1_train = hold_out(part1, validation_part1_documents)
+        validation += held
+    else:
+        part1_train = part1
 
     # Ablation nguồn: gt2 chiếm 53,6% khối lượng lấy mẫu nhưng phân bố type lệch hẳn so với
     # Part 3 (TRIỆU_CHỨNG 67% vs 39%), nên cần đo được phương án bỏ/giữ nó.
     train_by_source = {
-        "synthetic": synthetic_train, "gt2": gt2_train, "part1": part1,
+        "synthetic": synthetic_train, "gt2": gt2_train, "part1": part1_train,
     }
     for name in exclude:
         if name not in train_by_source:
@@ -379,7 +424,7 @@ def build(
 
     splits = {
         "train": train_by_source["synthetic"] + train_by_source["gt2"] + train_by_source["part1"],
-        "validation": validation + validation_synthetic,
+        "validation": validation,
         "test": test,
     }
     train_ids = {record["id"] for record in splits["train"]}
@@ -398,11 +443,17 @@ def build(
         "schema_version": 1,
         "track": "A",
         "part3_used_for": "test_only",
+        # Kế thừa cờ nhiễm từ pilot: nếu mẻ synthetic sinh ở Track C thì corpus cũng nhiễm.
+        "contaminated": any(
+            (json.loads((p / "pilot_manifest.json").read_text(encoding="utf-8"))
+             .get("contaminated") if (p / "pilot_manifest.json").exists() else False)
+            for p in pilot_dirs
+        ),
         "seed": seed,
         "sources": {
             "synthetic": {
-                "pilot": str(pilot_dir),
-                "drafts_sha256": _sha256(pilot_dir / "drafts.jsonl"),
+                "pilot": [str(p) for p in pilot_dirs],
+                "drafts_sha256": [_sha256(p / "drafts.jsonl") for p in pilot_dirs],
                 "assertions": "masked" if mask_synthetic_assertions else "trusted",
             },
             "gt2": {
@@ -430,13 +481,20 @@ def build(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--pilot", default="datasets/pilots/train_v2_5000_kept")
+    parser.add_argument(
+        "--pilot", default="datasets/pilots/train_v2_5000_kept",
+        help="Một hoặc nhiều thư mục pilot, ngăn cách bởi dấu phẩy",
+    )
     parser.add_argument("--out", default="datasets/ner_v2/track_a")
     parser.add_argument("--validation-documents", type=int, default=15)
     parser.add_argument("--seed", type=int, default=20260730)
     parser.add_argument(
         "--use-fixed", action="store_true",
         help="Dùng nhãn đã rà ở annotation/data/label_fixed và MỞ assertion của gt2",
+    )
+    parser.add_argument(
+        "--real-root",
+        help="Thư mục nhãn THẬT thay cho label_fixed, vd annotation/data/label_final",
     )
     parser.add_argument(
         "--exclude", default="",
@@ -447,15 +505,26 @@ def main() -> None:
         help="Số bản ghi synthetic giữ riêng cho validation để đo được assertion",
     )
     parser.add_argument(
+        "--validation-sources", default="gt2,synthetic",
+        help="Nguồn cho validation, ngăn cách bởi dấu phẩy: gt2,synthetic,part1",
+    )
+    parser.add_argument(
+        "--validation-part1", type=int, default=15,
+        help="Số tài liệu part1 giữ riêng khi part1 nằm trong --validation-sources",
+    )
+    parser.add_argument(
         "--mask-synthetic-assertions", action="store_true",
         help="Tắt supervision assertion của synthetic (mặc định BẬT từ mẻ v2)",
     )
     args = parser.parse_args()
     manifest = build(
-        _repo(args.pilot), _repo(args.out), args.validation_documents, args.seed,
+        [_repo(x.strip()) for x in args.pilot.split(",") if x.strip()], _repo(args.out), args.validation_documents, args.seed,
         args.mask_synthetic_assertions, args.validation_synthetic,
         tuple(name for name in args.exclude.split(',') if name.strip()),
         args.use_fixed,
+        args.real_root,
+        tuple(name.strip() for name in args.validation_sources.split(',') if name.strip()),
+        args.validation_part1,
     )
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
 

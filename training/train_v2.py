@@ -196,7 +196,7 @@ def evaluate(model, loader, id_to_label, device):
 
 def main():
     parser = argparse.ArgumentParser(description="Train hybrid BIO+span+assertion NER")
-    parser.add_argument("--data-dir", required=True)
+    parser.add_argument("--data-dir", "--data", dest="data_dir", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--epochs", type=float, default=5.0)

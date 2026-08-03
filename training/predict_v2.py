@@ -9,6 +9,11 @@ from pathlib import Path
 import torch
 
 from .schema_v2 import ASSERTION_TYPES
+from .assertion_policy import (
+    POLICIES,
+    assertions_from_probabilities,
+    resolve_thresholds,
+)
 
 from .model_v2 import HybridNER
 from .windowing_v2 import sliding_windows
@@ -81,6 +86,8 @@ def predict_text(
     type_threshold=0.60,
     disagreement_threshold=0.85,
     assertion_threshold=0.60,
+    assertion_thresholds=None,
+    assertion_policy="part3",
 ):
     labels = meta["labels"]
     types = meta["types"]
@@ -92,6 +99,9 @@ def predict_text(
     if eos is None:
         eos = tokenizer.sep_token_id
     unk = tokenizer.unk_token_id or tokenizer.pad_token_id or 0
+    per_assertion_thresholds = resolve_thresholds(
+        assertion_threshold, assertion_thresholds
+    )
     predictions = []
     for window in sliding_windows(text, max_words, overlap_words, include_header=True):
         prefix, content = window["prefix"], window["content"]
@@ -152,10 +162,16 @@ def predict_text(
             start, end = candidate["position"]
             entity_assertions = []
             if final_type in ASSERTION_TYPES:
-                entity_assertions = [
-                    name for assertion_index, name in enumerate(assertions)
-                    if float(assertion_probabilities[index, assertion_index]) >= assertion_threshold
-                ]
+                entity_assertions = assertions_from_probabilities(
+                    final_type,
+                    assertions,
+                    [
+                        float(assertion_probabilities[index, assertion_index])
+                        for assertion_index in range(len(assertions))
+                    ],
+                    per_assertion_thresholds,
+                    assertion_policy,
+                )
             predictions.append({
                 "text": text[start:end],
                 "position": [start, end],
@@ -200,6 +216,22 @@ def main():
     parser.add_argument("--type-threshold", type=float, default=0.60)
     parser.add_argument("--disagreement-threshold", type=float, default=0.85)
     parser.add_argument("--assertion-threshold", type=float, default=0.60)
+    parser.add_argument(
+        "--historical-threshold", type=float,
+        help="Threshold riêng cho isHistorical; mặc định dùng --assertion-threshold",
+    )
+    parser.add_argument(
+        "--negated-threshold", type=float,
+        help="Threshold riêng cho isNegated; mặc định dùng --assertion-threshold",
+    )
+    parser.add_argument(
+        "--family-threshold", type=float,
+        help="Threshold riêng cho isFamily; policy part3 vẫn luôn loại isFamily",
+    )
+    parser.add_argument(
+        "--assertion-policy", choices=POLICIES, default="part3",
+        help="part3 áp firewall đã được probe xác nhận; legacy giữ output model nguyên trạng",
+    )
     args = parser.parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     from transformers import AutoTokenizer
@@ -224,6 +256,12 @@ def main():
             text, model, tokenizer, meta, device,
             max_len, args.max_words, args.overlap_words,
             args.type_threshold, args.disagreement_threshold, args.assertion_threshold,
+            {
+                "isHistorical": args.historical_threshold,
+                "isNegated": args.negated_threshold,
+                "isFamily": args.family_threshold,
+            },
+            args.assertion_policy,
         )
         (Path(args.out_dir) / f"{Path(path).stem}.json").write_text(
             json.dumps(entities, ensure_ascii=False, indent=2), encoding="utf-8"

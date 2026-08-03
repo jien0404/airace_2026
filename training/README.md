@@ -51,6 +51,26 @@ python -m training.score_local \
 python -m normalize.run --in_dir runs/v2/track_a_xlmr/pred_part3 --out_dir output_v2_norm
 ```
 
+`predict_v2` mặc định áp assertion policy `part3`: loại `isFamily` và loại `isNegated` trên
+`CHẨN_ĐOÁN`. Dùng `--assertion-policy legacy` để tái tạo hành vi cũ. Thử threshold riêng mà
+không đổi checkpoint:
+
+```bash
+python -m training.predict_v2 \
+  --model runs/v2/track_a_xlmr/best --input input_turn2 \
+  --out result/track_a_assertion_v1 \
+  --assertion-policy part3 \
+  --historical-threshold 0.50 --negated-threshold 0.75
+```
+
+Prediction ZIP cũ không còn probability nên chỉ áp được firewall, không đổi threshold:
+
+```bash
+python -m training.assertion_policy \
+  --input-zip result/track_h_education_fpfix.zip \
+  --out-zip result/track_h_education_fpfix_assertion_firewall.zip
+```
+
 [`score_local.py`](score_local.py) chấm theo **chồng lấn + đúng type**, ranh giới không tính —
 đúng cơ chế đã cô lập trên leaderboard. Chọn checkpoint theo `overlap.f1`, đừng theo
 `boundary_f1_reference_only`.

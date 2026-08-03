@@ -1,6 +1,31 @@
+# Local/private data and model artifacts
 medical_dataset/
+datasets/
+input_turn2/
+runs/
+*.zip
+*.log
+.env
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Generated/private project directories
+annotation/data/
+annotation/scripts/
+dictionary/
+data_gen/_archive/generated_runs/
+training/old_dataset/
+training/ds*/
+training/dataset_v2*/
+
+# Existing tool-specific outputs
 test_baseline_models/vietmed_ner/output/
+test_baseline_models/vietmed_ner/postprocess_output/
 test_baseline_models/vietmed_ner/vncorenlp/
 test_baseline_models/vietmed_ner/.venv/
-__pycache__/
-test_baseline_models/vietmed_ner/postprocess_output/
