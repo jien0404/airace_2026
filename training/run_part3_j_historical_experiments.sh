@@ -2,9 +2,10 @@
 set -euo pipefail
 
 # Baseline so sánh: part3_i_wer_only_30e_lr2e5.
-# Script chỉ chạy hai thí nghiệm J; không chạy lại H hoặc I.
+# Script chỉ chạy hai thí nghiệm J; không chạy lại H hoặc I.  Dùng ZIP đã patch thủ công:
+# thuốc trước nhập viện/thuốc mới dùng gần đây là active; chỉ episode/toa cũ rõ ràng historical.
 
-unzip -q -o ner_J_part3_historical_scope_v2_windows_20260803.zip \
+unzip -q -o ner_J_part3_historical_scope_v2_windows_20260803_repaired.zip \
   -d datasets/ner_J_part3_historical_scope_v2_windows_20260803/
 
 python -m training.train_v2 \

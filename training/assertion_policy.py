@@ -6,6 +6,9 @@ Policy ``part3`` chỉ chứa những luật đã được probe nhãn-thuần x
 * không xuất ``isNegated`` trên ``CHẨN_ĐOÁN``;
 * assertion chỉ áp dụng cho TRIỆU_CHỨNG/CHẨN_ĐOÁN/THUỐC.
 
+Data synthetic dùng cùng convention: ``isFamily`` và ``isNegated`` trên ``CHẨN_ĐOÁN`` không
+được dùng làm supervision trực tiếp; nếu cần xử lý các pattern hiếm đó thì làm ở hậu xử lý.
+
 Không chặn ``isHistorical`` trên THUỐC ở inference: nghiệp vụ này chỉ yêu cầu thận trọng,
 không phải luật cấm tuyệt đối.  ``legacy`` giữ nguyên output để làm đối chứng.
 """
