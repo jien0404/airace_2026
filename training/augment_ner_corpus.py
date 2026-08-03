@@ -100,13 +100,13 @@ def _normalize_assertions(records: list[dict[str, Any]]) -> Counter:
 
 
 def _targeted_records(
-    pilot: Path, drafts: list[dict[str, Any]],
+    pilot: Path, drafts: list[dict[str, Any]], *, mask_assertions: bool = False,
 ) -> tuple[list[dict[str, Any]], Counter]:
     stats: Counter = Counter()
     # Use the same canonical cleaning path as the normal corpus builder.  This verifies offsets
     # once more and drops no data silently: the caller compares the resulting count below.
     # Importing load_synthetic keeps the exact occurrence/assertion conventions in one place.
-    loaded = load_synthetic(pilot, stats, mask_assertions=False)
+    loaded = load_synthetic(pilot, stats, mask_assertions=mask_assertions)
     if len(loaded) != len(drafts):
         raise RuntimeError(
             f"cleaning làm mất draft ở {pilot}: loaded={len(loaded)} drafts={len(drafts)} "
@@ -147,7 +147,12 @@ def build(parent_dir: Path, pilot_dirs: list[Path], out_dir: Path, *, overwrite:
     pilot_reports: list[dict[str, Any]] = []
     for pilot in pilot_dirs:
         checked = _pilot_gate(pilot)
-        added, assertion_corrections = _targeted_records(pilot, checked["drafts"])
+        mode = checked["manifest"].get("mode")
+        added, assertion_corrections = _targeted_records(
+            pilot,
+            checked["drafts"],
+            mask_assertions=mode in {"wer", "k_wer"},
+        )
         collisions = parent_ids & {record["id"] for record in added}
         if collisions:
             raise RuntimeError(f"id targeted đụng parent: {sorted(collisions)[:5]}")
@@ -162,6 +167,7 @@ def build(parent_dir: Path, pilot_dirs: list[Path], out_dir: Path, *, overwrite:
             "profiles": checked["manifest"].get("profiles", {}),
             "error_kinds": checked["manifest"].get("error_kinds", {}),
             "genres": checked["manifest"].get("genres", {}),
+            "assertion_supervision_masked": mode in {"wer", "k_wer"},
             "assertion_corrections_at_ingest": dict(assertion_corrections),
         })
         all_added.extend(added)

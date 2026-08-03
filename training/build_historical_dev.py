@@ -1,4 +1,4 @@
-"""Build an independent historical-scope diagnostic window file from a reviewed pilot."""
+"""Build independent diagnostic windows from an analogue-only targeted pilot."""
 
 from __future__ import annotations
 
@@ -12,11 +12,14 @@ from .build_dataset_v2 import record_to_windows
 
 def build(pilot: Path, out: Path, *, max_words: int, overlap_words: int, seed: int) -> dict:
     checked = _pilot_gate(pilot)
-    if checked["manifest"].get("mode") != "historical":
-        raise RuntimeError(f"Pilot dev không phải historical mode: {pilot}")
+    mode = checked["manifest"].get("mode")
+    if mode not in {"historical", "k_wer", "k_assertion"}:
+        raise RuntimeError(f"Pilot dev không phải targeted diagnostic mode: {pilot}")
     if checked["manifest"].get("direct_replay", 0):
         raise RuntimeError("Historical dev phải independent: direct_replay bắt buộc bằng 0")
-    records, corrections = _targeted_records(pilot, checked["drafts"])
+    records, corrections = _targeted_records(
+        pilot, checked["drafts"], mask_assertions=mode == "k_wer"
+    )
     windows = []
     coverage_errors = []
     for record in records:
@@ -43,6 +46,8 @@ def build(pilot: Path, out: Path, *, max_words: int, overlap_words: int, seed: i
         "windows": len(windows),
         "entities": sum(len(row["spans"]) for row in windows),
         "direct_replay": 0,
+        "mode": mode,
+        "assertion_supervision_masked": mode == "k_wer",
         "assertion_corrections_at_ingest": dict(corrections),
         "max_words": max_words,
         "overlap_words": overlap_words,

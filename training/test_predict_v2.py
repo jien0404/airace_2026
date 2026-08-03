@@ -11,6 +11,7 @@ from training.assertion_policy import (
     assertions_from_probabilities,
     postprocess_zip,
     resolve_thresholds,
+    resolve_type_thresholds,
 )
 
 
@@ -64,6 +65,36 @@ class AssertionPolicyTest(unittest.TestCase):
             "part3",
         )
         self.assertEqual(selected, ["isHistorical"])
+
+    def test_entity_type_threshold_overrides_assertion_threshold(self):
+        thresholds = resolve_thresholds(0.60, {"isHistorical": 0.55})
+        type_thresholds = resolve_type_thresholds({
+            "isHistorical": {
+                "CHẨN_ĐOÁN": 0.45,
+                "TRIỆU_CHỨNG": 0.80,
+            }
+        })
+        diagnosis = assertions_from_probabilities(
+            "CHẨN_ĐOÁN", ["isHistorical"], [0.50], thresholds, "part3",
+            type_thresholds,
+        )
+        symptom = assertions_from_probabilities(
+            "TRIỆU_CHỨNG", ["isHistorical"], [0.70], thresholds, "part3",
+            type_thresholds,
+        )
+        drug = assertions_from_probabilities(
+            "THUỐC", ["isHistorical"], [0.56], thresholds, "part3",
+            type_thresholds,
+        )
+        self.assertEqual(diagnosis, ["isHistorical"])
+        self.assertEqual(symptom, [])
+        self.assertEqual(drug, ["isHistorical"])
+
+    def test_entity_type_threshold_map_rejects_invalid_keys(self):
+        with self.assertRaisesRegex(ValueError, "Assertion không hợp lệ"):
+            resolve_type_thresholds({"notAnAssertion": {"THUỐC": 0.5}})
+        with self.assertRaisesRegex(ValueError, "Entity type"):
+            resolve_type_thresholds({"isHistorical": {"TÊN_XÉT_NGHIỆM": 0.5}})
 
     def test_legacy_keeps_family_and_negated_diagnosis(self):
         thresholds = resolve_thresholds(0.60)

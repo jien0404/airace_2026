@@ -21,7 +21,7 @@ import json
 import zipfile
 from collections import Counter
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from .schema_v2 import ASSERTIONS, ASSERTION_TYPES
 
@@ -43,6 +43,45 @@ def resolve_thresholds(
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"Threshold {name} phải trong [0,1], nhận {value}")
     return values
+
+
+def resolve_type_thresholds(
+    overrides: Mapping[str, Mapping[str, float]] | None = None,
+) -> dict[str, dict[str, float]]:
+    """Validate threshold overrides keyed by assertion then entity type.
+
+    The returned mapping is deliberately sparse.  Callers fall back to the existing
+    per-assertion/global threshold when a pair is absent, so old command lines and checkpoints
+    keep exactly the same behaviour.
+    """
+    values: dict[str, dict[str, float]] = {}
+    for assertion, by_type in (overrides or {}).items():
+        if assertion not in ASSERTIONS:
+            raise ValueError(f"Assertion không hợp lệ trong threshold map: {assertion}")
+        if not isinstance(by_type, Mapping):
+            raise ValueError(f"Threshold map của {assertion} phải là object theo entity type")
+        current: dict[str, float] = {}
+        for entity_type, raw_value in by_type.items():
+            if entity_type not in ASSERTION_TYPES:
+                raise ValueError(
+                    f"Entity type không hỗ trợ assertion trong threshold map: {entity_type}"
+                )
+            value = float(raw_value)
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(
+                    f"Threshold {assertion}/{entity_type} phải trong [0,1], nhận {value}"
+                )
+            current[entity_type] = value
+        values[assertion] = current
+    return values
+
+
+def load_type_thresholds(path: Path) -> dict[str, dict[str, float]]:
+    """Load ``{assertion: {entity_type: threshold}}`` from JSON."""
+    raw: Any = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, Mapping):
+        raise ValueError("Assertion threshold map phải là một JSON object")
+    return resolve_type_thresholds(raw)
 
 
 def filter_assertions(
@@ -70,14 +109,17 @@ def assertions_from_probabilities(
     probabilities: Sequence[float],
     thresholds: Mapping[str, float],
     policy: str = "part3",
+    type_thresholds: Mapping[str, Mapping[str, float]] | None = None,
 ) -> list[str]:
     if len(names) != len(probabilities):
         raise ValueError("Số assertion và probability không khớp")
-    selected = [
-        name
-        for name, probability in zip(names, probabilities)
-        if float(probability) >= thresholds[name]
-    ]
+    selected = []
+    for name, probability in zip(names, probabilities):
+        threshold = (type_thresholds or {}).get(name, {}).get(
+            entity_type, thresholds[name]
+        )
+        if float(probability) >= threshold:
+            selected.append(name)
     return filter_assertions(entity_type, selected, policy)
 
 

@@ -12,6 +12,7 @@ from .schema_v2 import ASSERTION_TYPES
 from .assertion_policy import (
     POLICIES,
     assertions_from_probabilities,
+    load_type_thresholds,
     resolve_thresholds,
 )
 
@@ -81,6 +82,7 @@ def _merge_predictions(
     assertion_thresholds,
     assertion_policy,
     assertion_aggregation="selected",
+    assertion_type_thresholds=None,
 ):
     """Gộp output các cửa sổ và chốt assertion sau khi gộp.
 
@@ -137,6 +139,7 @@ def _merge_predictions(
                 probabilities,
                 assertion_thresholds,
                 assertion_policy,
+                assertion_type_thresholds,
             )
         else:
             entity["assertions"] = []
@@ -158,6 +161,7 @@ def predict_text(
     disagreement_threshold=0.85,
     assertion_threshold=0.60,
     assertion_thresholds=None,
+    assertion_type_thresholds=None,
     assertion_policy="part3",
     assertion_aggregation="selected",
 ):
@@ -255,6 +259,7 @@ def predict_text(
         per_assertion_thresholds,
         assertion_policy,
         assertion_aggregation,
+        assertion_type_thresholds,
     )
 
 
@@ -285,6 +290,13 @@ def main():
         help="Threshold riêng cho isFamily; policy part3 vẫn luôn loại isFamily",
     )
     parser.add_argument(
+        "--assertion-threshold-map",
+        help=(
+            "JSON threshold theo assertion và entity type; ví dụ "
+            "{isHistorical: {CHẨN_ĐOÁN: 0.5}}. Giá trị này ưu tiên hơn các flag chung."
+        ),
+    )
+    parser.add_argument(
         "--assertion-policy", choices=POLICIES, default="part3",
         help="part3 áp firewall đã được probe xác nhận; legacy giữ output model nguyên trạng",
     )
@@ -293,6 +305,10 @@ def main():
         help="selected giữ cửa sổ NER-confidence cao nhất; max gộp max probability assertion qua overlap",
     )
     args = parser.parse_args()
+    assertion_type_thresholds = (
+        load_type_thresholds(Path(args.assertion_threshold_map))
+        if args.assertion_threshold_map else {}
+    )
     device = "cuda" if torch.cuda.is_available() else "cpu"
     from transformers import AutoTokenizer
     try:
@@ -314,15 +330,20 @@ def main():
         text = Path(path).read_text(encoding="utf-8")
         entities = predict_text(
             text, model, tokenizer, meta, device,
-            max_len, args.max_words, args.overlap_words,
-            args.type_threshold, args.disagreement_threshold, args.assertion_threshold,
-            {
+            max_len=max_len,
+            max_words=args.max_words,
+            overlap_words=args.overlap_words,
+            type_threshold=args.type_threshold,
+            disagreement_threshold=args.disagreement_threshold,
+            assertion_threshold=args.assertion_threshold,
+            assertion_thresholds={
                 "isHistorical": args.historical_threshold,
                 "isNegated": args.negated_threshold,
                 "isFamily": args.family_threshold,
             },
-            args.assertion_policy,
-            args.assertion_aggregation,
+            assertion_type_thresholds=assertion_type_thresholds,
+            assertion_policy=args.assertion_policy,
+            assertion_aggregation=args.assertion_aggregation,
         )
         (Path(args.out_dir) / f"{Path(path).stem}.json").write_text(
             json.dumps(entities, ensure_ascii=False, indent=2), encoding="utf-8"
