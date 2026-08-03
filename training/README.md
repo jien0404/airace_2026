@@ -71,6 +71,29 @@ python -m training.assertion_policy \
   --out-zip result/track_h_education_fpfix_assertion_firewall.zip
 ```
 
+Thử nghiệm gộp assertion qua các cửa sổ overlap, giữ nguyên span/type theo cửa sổ có NER
+confidence cao nhất:
+
+```bash
+python -m training.predict_v2 \
+  --model runs/track_h_education_fpfix/best --input input_turn2 \
+  --out result/track_h_assertion_window_aggregation \
+  --assertion-policy part3 --assertion-aggregation max
+```
+
+Thử nghiệm window dài hơn (chỉ dùng nếu checkpoint/encoder đủ sức chứa):
+
+```bash
+python -m training.predict_v2 \
+  --model runs/track_h_education_fpfix/best --input input_turn2 \
+  --out result/track_h_assertion_long_window \
+  --max-len 512 --max-words 360 --overlap-words 90 \
+  --assertion-policy part3 --assertion-aggregation selected
+```
+
+Để tách hai tác động, chạy thêm cấu hình kết hợp `--assertion-aggregation max` trên cùng
+window dài. Chỉ so WER + assertion; candidates vẫn để nguyên.
+
 [`score_local.py`](score_local.py) chấm theo **chồng lấn + đúng type**, ranh giới không tính —
 đúng cơ chế đã cô lập trên leaderboard. Chọn checkpoint theo `overlap.f1`, đừng theo
 `boundary_f1_reference_only`.

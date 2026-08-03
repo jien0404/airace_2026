@@ -5,7 +5,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from training.predict_v2 import encoder_capacity, _encode_words
+from training.predict_v2 import encoder_capacity, _encode_words, _merge_predictions
 from training.assertion_policy import (
     apply_policy_to_predictions,
     assertions_from_probabilities,
@@ -95,6 +95,43 @@ class AssertionPolicyTest(unittest.TestCase):
             self.assertEqual(output[0]["assertions"], [])
             self.assertEqual(output[0]["position"], [5, 8])
             self.assertEqual(report["removed:TRIỆU_CHỨNG:isFamily"], 1)
+
+    def test_max_aggregation_uses_assertion_from_overlap(self):
+        thresholds = resolve_thresholds(0.60)
+
+        def rows():
+            return [
+                {
+                    "text": "đau",
+                    "position": [0, 3],
+                    "type": "TRIỆU_CHỨNG",
+                    "assertions": [],
+                    "candidates": [],
+                    "_confidence": 0.95,
+                    "_assertion_probabilities": [0.20, 0.90, 0.40],
+                },
+                {
+                    "text": "đau",
+                    "position": [0, 3],
+                    "type": "TRIỆU_CHỨNG",
+                    "assertions": [],
+                    "candidates": [],
+                    "_confidence": 0.80,
+                    "_assertion_probabilities": [0.10, 0.10, 0.80],
+                },
+            ]
+
+        selected = _merge_predictions(
+            rows(), ["isNegated", "isFamily", "isHistorical"],
+            thresholds, "part3", "selected",
+        )
+        aggregated = _merge_predictions(
+            rows(), ["isNegated", "isFamily", "isHistorical"],
+            thresholds, "part3", "max",
+        )
+        self.assertEqual(selected[0]["assertions"], [])
+        self.assertEqual(aggregated[0]["assertions"], ["isHistorical"])
+        self.assertEqual(aggregated[0]["candidates"], [])
 
 
 if __name__ == "__main__":

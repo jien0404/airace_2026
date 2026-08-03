@@ -18,6 +18,8 @@ from .assertion_policy import (
 from .model_v2 import HybridNER
 from .windowing_v2 import sliding_windows
 
+ASSERTION_AGGREGATIONS = ("selected", "max")
+
 
 def encoder_capacity(model) -> int:
     """Số token TỐI ĐA encoder nhận được.
@@ -73,6 +75,75 @@ def _decode_bio(labels, probs, tokens):
     return candidates
 
 
+def _merge_predictions(
+    predictions,
+    assertion_names,
+    assertion_thresholds,
+    assertion_policy,
+    assertion_aggregation="selected",
+):
+    """Gộp output các cửa sổ và chốt assertion sau khi gộp.
+
+    ``selected`` giữ hành vi cũ: assertion lấy từ bản sao có NER confidence cao nhất.
+    ``max`` giữ span/type theo bản sao tốt nhất nhưng lấy max probability assertion qua
+    mọi bản sao có cùng span/type. Đây là ablation inference-only cho cue nằm ở một cửa sổ
+    overlap khác; không thay đổi candidate, span hay type.
+    """
+    if assertion_aggregation not in ASSERTION_AGGREGATIONS:
+        raise ValueError(f"Assertion aggregation không hợp lệ: {assertion_aggregation}")
+    exact = {}
+    for entity in predictions:
+        key = (tuple(entity["position"]), entity["type"])
+        current = exact.get(key)
+        if current is None:
+            exact[key] = entity
+            continue
+        aggregate = None
+        if assertion_aggregation == "max":
+            left = current.get("_assertion_probabilities") or []
+            right = entity.get("_assertion_probabilities") or []
+            if len(left) != len(right):
+                raise ValueError("Số assertion probability giữa các cửa sổ không khớp")
+            aggregate = [max(a, b) for a, b in zip(left, right)]
+        if entity["_confidence"] > current["_confidence"]:
+            exact[key] = entity
+            current = entity
+        if aggregate is not None:
+            current["_assertion_probabilities"] = aggregate
+
+    chosen = []
+    for entity in sorted(
+        exact.values(),
+        key=lambda row: (
+            -row["_confidence"],
+            -(row["position"][1] - row["position"][0]),
+            row["position"][0],
+        ),
+    ):
+        start, end = entity["position"]
+        if any(
+            not (end <= other["position"][0] or start >= other["position"][1])
+            for other in chosen
+        ):
+            continue
+        chosen.append(entity)
+    chosen.sort(key=lambda row: row["position"])
+    for entity in chosen:
+        probabilities = entity.pop("_assertion_probabilities", [])
+        if entity["type"] in ASSERTION_TYPES:
+            entity["assertions"] = assertions_from_probabilities(
+                entity["type"],
+                assertion_names,
+                probabilities,
+                assertion_thresholds,
+                assertion_policy,
+            )
+        else:
+            entity["assertions"] = []
+        entity.pop("_confidence", None)
+    return chosen
+
+
 @torch.no_grad()
 def predict_text(
     text,
@@ -88,6 +159,7 @@ def predict_text(
     assertion_threshold=0.60,
     assertion_thresholds=None,
     assertion_policy="part3",
+    assertion_aggregation="selected",
 ):
     labels = meta["labels"]
     types = meta["types"]
@@ -160,46 +232,30 @@ def predict_text(
                     )
                     confidence = max(candidate["bio_confidence"], span_confidence)
             start, end = candidate["position"]
-            entity_assertions = []
+            assertion_probabilities_for_entity = []
             if final_type in ASSERTION_TYPES:
-                entity_assertions = assertions_from_probabilities(
-                    final_type,
-                    assertions,
-                    [
-                        float(assertion_probabilities[index, assertion_index])
-                        for assertion_index in range(len(assertions))
-                    ],
-                    per_assertion_thresholds,
-                    assertion_policy,
-                )
+                assertion_probabilities_for_entity = [
+                    float(assertion_probabilities[index, assertion_index])
+                    for assertion_index in range(len(assertions))
+                ]
             predictions.append({
                 "text": text[start:end],
                 "position": [start, end],
                 "type": final_type,
-                "assertions": entity_assertions,
+                "assertions": [],
                 "candidates": [],
                 "_confidence": confidence,
+                "_assertion_probabilities": assertion_probabilities_for_entity,
             })
     # Hợp nhất overlap từ sliding windows. Same span/type giữ confidence cao nhất;
     # khác span cạnh tranh thì ưu tiên confidence cao, sau đó span dài hơn.
-    exact = {}
-    for entity in predictions:
-        key = (tuple(entity["position"]), entity["type"])
-        if key not in exact or entity["_confidence"] > exact[key]["_confidence"]:
-            exact[key] = entity
-    chosen = []
-    for entity in sorted(
-        exact.values(),
-        key=lambda row: (-row["_confidence"], -(row["position"][1] - row["position"][0]), row["position"][0]),
-    ):
-        start, end = entity["position"]
-        if any(not (end <= other["position"][0] or start >= other["position"][1]) for other in chosen):
-            continue
-        chosen.append(entity)
-    chosen.sort(key=lambda row: row["position"])
-    for entity in chosen:
-        entity.pop("_confidence", None)
-    return chosen
+    return _merge_predictions(
+        predictions,
+        assertions,
+        per_assertion_thresholds,
+        assertion_policy,
+        assertion_aggregation,
+    )
 
 
 def main():
@@ -232,6 +288,10 @@ def main():
         "--assertion-policy", choices=POLICIES, default="part3",
         help="part3 áp firewall đã được probe xác nhận; legacy giữ output model nguyên trạng",
     )
+    parser.add_argument(
+        "--assertion-aggregation", choices=ASSERTION_AGGREGATIONS, default="selected",
+        help="selected giữ cửa sổ NER-confidence cao nhất; max gộp max probability assertion qua overlap",
+    )
     args = parser.parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     from transformers import AutoTokenizer
@@ -262,6 +322,7 @@ def main():
                 "isFamily": args.family_threshold,
             },
             args.assertion_policy,
+            args.assertion_aggregation,
         )
         (Path(args.out_dir) / f"{Path(path).stem}.json").write_text(
             json.dumps(entities, ensure_ascii=False, indent=2), encoding="utf-8"
