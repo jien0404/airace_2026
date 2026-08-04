@@ -73,7 +73,10 @@ def collect(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--dev", required=True, help="Reviewed analogue-only window JSONL")
+    parser.add_argument(
+        "--dev", action="append", required=True,
+        help="Reviewed analogue-only window JSONL; có thể lặp để calibrate trên dev hợp nhất",
+    )
     parser.add_argument("--out-map", required=True)
     parser.add_argument("--out-report")
     parser.add_argument("--batch-size", type=int, default=64)
@@ -82,6 +85,10 @@ def main() -> int:
     parser.add_argument("--high", type=float, default=0.85)
     parser.add_argument("--step", type=float, default=0.05)
     parser.add_argument("--min-positives", type=int, default=3)
+    parser.add_argument(
+        "--focus-assertion", action="append", default=[],
+        help="Chỉ calibrate assertion được nêu; có thể lặp. Mặc định calibrate mọi assertion.",
+    )
     parser.add_argument("--seed", type=int, default=20260803)
     args = parser.parse_args()
     if not (0 <= args.low <= args.high <= 1 and args.step > 0):
@@ -92,7 +99,10 @@ def main() -> int:
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, use_fast=True)
     labels = list(meta["labels"])
     label_to_id = {label: index for index, label in enumerate(labels)}
-    rows = read_jsonl(Path(args.dev))
+    dev_paths = [Path(value) for value in args.dev]
+    rows = [row for path in dev_paths for row in read_jsonl(path)]
+    if not rows:
+        raise SystemExit("Các --dev không được rỗng")
     dataset = HybridDataset(
         rows, tokenizer, label_to_id, max_len=int(meta["max_len"]), seed=args.seed
     )
@@ -101,12 +111,21 @@ def main() -> int:
         collate_fn=lambda batch: collate(batch, dataset.pad),
     )
     assertion_names = list(meta["assertions"])
+    unknown_focus = sorted(set(args.focus_assertion) - set(assertion_names))
+    if unknown_focus:
+        raise SystemExit(
+            f"--focus-assertion không có trong checkpoint: {unknown_focus}; "
+            f"hợp lệ={assertion_names}"
+        )
+    focused_assertions = set(args.focus_assertion or assertion_names)
     type_names = list(meta["types"])
     collected = collect(model, loader, assertion_names, type_names, device)
     thresholds: dict[str, dict[str, float]] = defaultdict(dict)
     pair_reports = []
     candidates = _grid(args.low, args.high, args.step)
     for (assertion, entity_type), (probabilities, gold) in sorted(collected.items()):
+        if assertion not in focused_assertions:
+            continue
         positives = sum(gold)
         allowed = not (
             assertion == "isFamily"
@@ -144,12 +163,13 @@ def main() -> int:
     out_map.parent.mkdir(parents=True, exist_ok=True)
     out_map.write_text(json.dumps(sparse_map, ensure_ascii=False, indent=2), encoding="utf-8")
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "checkpoint": str(Path(args.checkpoint).resolve()),
-        "dev": str(Path(args.dev).resolve()),
+        "dev": [str(path.resolve()) for path in dev_paths],
         "dev_windows": len(rows),
         "global_threshold": args.global_threshold,
         "min_positives": args.min_positives,
+        "focus_assertions": sorted(focused_assertions),
         "selected_sparse_map": sparse_map,
         "selection_rule": "max F1, then precision, then nearest global threshold",
         "part3_firewall_applied_at_inference": True,

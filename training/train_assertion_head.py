@@ -33,11 +33,14 @@ def _focused_row_hash(model: HybridNER, index: int) -> str:
     return digest.hexdigest()
 
 
-def _sampler_weights(rows: list[dict], prefix: str, targeted_mass: float) -> list[float]:
+def _sampler_weights(
+    rows: list[dict], prefix: str | tuple[str, ...] | list[str], targeted_mass: float
+) -> list[float]:
     """Backward-compatible wrapper used by historical tests and old scripts."""
+    prefixes = (prefix,) if isinstance(prefix, str) else tuple(prefix)
     try:
         weights, _ = targeted_sampler_weights(
-            rows, prefixes=(prefix,), targeted_mass=targeted_mass
+            rows, prefixes=prefixes, targeted_mass=targeted_mass
         )
     except ValueError as error:
         raise RuntimeError(str(error)) from error
@@ -98,12 +101,19 @@ def main() -> None:
     parser.add_argument("--init-checkpoint", required=True, help="Checkpoint HybridNER baseline")
     parser.add_argument("--historical-dev", required=True, help="Window JSONL dev independent")
     parser.add_argument(
+        "--safety-dev",
+        help="Dev hard-negative độc lập bổ sung; chỉ làm guardrail, không thay historical-dev",
+    )
+    parser.add_argument(
         "--public-dev",
         help="Part 3 gán tay ở dạng window; mặc định dùng test.jsonl của dataset",
     )
     parser.add_argument("--out", required=True)
     parser.add_argument("--focus", default="isHistorical")
-    parser.add_argument("--targeted-id-prefix", required=True)
+    parser.add_argument(
+        "--targeted-id-prefix", action="append", required=True,
+        help="Có thể lặp flag để gom nhiều pilot targeted vào cùng sampler mass",
+    )
     parser.add_argument("--targeted-mass", type=float, default=0.10)
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -114,14 +124,31 @@ def main() -> None:
         "--independent-dev-tolerance", type=float, default=0.01,
         help="Mức giảm F1 tối đa trên dev độc lập khi chọn theo public dev",
     )
+    parser.add_argument(
+        "--public-dev-tolerance", type=float, default=0.01,
+        help="Mức giảm F1 tối đa trên public dev khi historical-dev là tiêu chí chính",
+    )
+    parser.add_argument(
+        "--safety-dev-tolerance", type=float, default=0.01,
+        help="Mức giảm F1 tối đa trên safety-dev so với checkpoint khởi tạo",
+    )
+    parser.add_argument(
+        "--selection-mode",
+        choices=("public_first", "independent_first"),
+        default="public_first",
+        help="L giữ public_first; M dùng independent_first để không chọn epoch trực tiếp theo Part 3",
+    )
     parser.add_argument("--save-every-epoch", action="store_true")
     parser.add_argument("--seed", type=int, default=20260803)
     parser.add_argument("--fp16", action="store_true")
     args = parser.parse_args()
     if not 0 < args.targeted_mass < 1:
         raise SystemExit("--targeted-mass phải nằm trong (0,1)")
-    if not 0 <= args.independent_dev_tolerance <= 1:
-        raise SystemExit("--independent-dev-tolerance phải nằm trong [0,1]")
+    for name in (
+        "independent_dev_tolerance", "public_dev_tolerance", "safety_dev_tolerance"
+    ):
+        if not 0 <= getattr(args, name) <= 1:
+            raise SystemExit(f"--{name.replace('_', '-')} phải nằm trong [0,1]")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -143,6 +170,7 @@ def main() -> None:
     train_rows = read_jsonl(data_dir / "train.jsonl")
     validation_rows = read_jsonl(data_dir / "validation.jsonl")
     dev_rows = read_jsonl(Path(args.historical_dev))
+    safety_dev_rows = read_jsonl(Path(args.safety_dev)) if args.safety_dev else []
     public_dev_path = Path(args.public_dev) if args.public_dev else data_dir / "test.jsonl"
     public_dev_rows = read_jsonl(public_dev_path)
     if not train_rows or not validation_rows or not dev_rows or not public_dev_rows:
@@ -162,6 +190,12 @@ def main() -> None:
     )
     dev_loader = _loader(
         dev_rows, tokenizer, label_to_id, max_len, args.eval_batch_size, args.seed
+    )
+    safety_dev_loader = (
+        _loader(
+            safety_dev_rows, tokenizer, label_to_id, max_len, args.eval_batch_size, args.seed
+        )
+        if safety_dev_rows else None
     )
     public_dev_loader = _loader(
         public_dev_rows, tokenizer, label_to_id, max_len, args.eval_batch_size, args.seed
@@ -206,12 +240,34 @@ def main() -> None:
     initial_public = evaluate_focus(
         model, public_dev_loader, assertion_index, device, args.threshold
     )
+    initial_safety = (
+        evaluate_focus(model, safety_dev_loader, assertion_index, device, args.threshold)
+        if safety_dev_loader is not None else None
+    )
     initial_metrics = {
         "historical_dev": initial_dev,
         "public_dev": initial_public,
         "validation": initial_val,
     }
-    best_key = (initial_public["f1"], initial_dev["f1"], initial_val["f1"])
+    if initial_safety is not None:
+        initial_metrics["safety_dev"] = initial_safety
+
+    def selection_key(metrics: dict) -> tuple[float, ...]:
+        if args.selection_mode == "independent_first":
+            return (
+                float(metrics["historical_dev"]["f1"]),
+                float((metrics.get("safety_dev") or metrics["historical_dev"])["f1"]),
+                float(metrics["public_dev"]["f1"]),
+                float(metrics["validation"]["f1"]),
+            )
+        return (
+            float(metrics["public_dev"]["f1"]),
+            float(metrics["historical_dev"]["f1"]),
+            float((metrics.get("safety_dev") or metrics["historical_dev"])["f1"]),
+            float(metrics["validation"]["f1"]),
+        )
+
+    best_key = selection_key(initial_metrics)
     save_checkpoint(args.out + "/best", 0, initial_metrics)
     history.append({"epoch": 0, **initial_metrics, "eligible": True})
 
@@ -245,10 +301,25 @@ def main() -> None:
         public_metrics = evaluate_focus(
             model, public_dev_loader, assertion_index, device, args.threshold
         )
-        eligible = (
-            dev_metrics["f1"]
-            >= initial_dev["f1"] - args.independent_dev_tolerance
+        safety_metrics = (
+            evaluate_focus(model, safety_dev_loader, assertion_index, device, args.threshold)
+            if safety_dev_loader is not None else None
         )
+        if args.selection_mode == "independent_first":
+            eligible = (
+                public_metrics["f1"]
+                >= initial_public["f1"] - args.public_dev_tolerance
+            )
+        else:
+            eligible = (
+                dev_metrics["f1"]
+                >= initial_dev["f1"] - args.independent_dev_tolerance
+            )
+        if safety_metrics is not None and initial_safety is not None:
+            eligible = eligible and (
+                safety_metrics["f1"]
+                >= initial_safety["f1"] - args.safety_dev_tolerance
+            )
         row = {
             "epoch": epoch,
             "historical_dev": dev_metrics,
@@ -256,11 +327,13 @@ def main() -> None:
             "validation": validation_metrics,
             "eligible": eligible,
         }
+        if safety_metrics is not None:
+            row["safety_dev"] = safety_metrics
         history.append(row)
         print(json.dumps(row, ensure_ascii=False), flush=True)
         if args.save_every_epoch:
             save_checkpoint(args.out + f"/epoch-{epoch:03d}", epoch, row)
-        key = (public_metrics["f1"], dev_metrics["f1"], validation_metrics["f1"])
+        key = selection_key(row)
         if eligible and key > best_key:
             best_key = key
             save_checkpoint(args.out + "/best", epoch, row)
@@ -276,19 +349,33 @@ def main() -> None:
         for index, name in enumerate(assertion_names) if index != assertion_index
     }
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "init_checkpoint": str(Path(args.init_checkpoint).resolve()),
         "focus": args.focus,
         "targeted_mass": args.targeted_mass,
+        "targeted_id_prefixes": list(args.targeted_id_prefix),
         "targeted_windows": sum(
-            str(row.get("record_id") or "").startswith(args.targeted_id_prefix)
+            any(
+                str(row.get("record_id") or "").startswith(prefix)
+                for prefix in args.targeted_id_prefix
+            )
             for row in train_rows
         ),
         "train_windows": len(train_rows),
         "historical_dev_windows": len(dev_rows),
+        "safety_dev": str(Path(args.safety_dev).resolve()) if args.safety_dev else None,
+        "safety_dev_windows": len(safety_dev_rows),
         "public_dev": str(public_dev_path.resolve()),
         "public_dev_windows": len(public_dev_rows),
         "independent_dev_tolerance": args.independent_dev_tolerance,
+        "public_dev_tolerance": args.public_dev_tolerance,
+        "safety_dev_tolerance": args.safety_dev_tolerance,
+        "selection_mode": args.selection_mode,
+        "selection_order": (
+            ["historical_dev", "safety_dev", "public_dev", "validation"]
+            if args.selection_mode == "independent_first" else
+            ["public_dev", "historical_dev", "safety_dev", "validation"]
+        ),
         "frozen_modules_unchanged": frozen_modules == frozen_after,
         "nonfocus_assertion_rows_unchanged": nonfocus_before == nonfocus_after,
         "focus_row_changed": focus_before != _focused_row_hash(model, assertion_index),

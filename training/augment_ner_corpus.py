@@ -181,10 +181,13 @@ def build(parent_dir: Path, pilot_dirs: list[Path], out_dir: Path, *, overwrite:
     (out_dir / "test.jsonl").write_bytes(parent_test_bytes)
 
     parent_manifest = json.loads(parent_manifest_path.read_text(encoding="utf-8"))
+    direct_replay_records = sum(
+        int(report.get("direct_replay") or 0) for report in pilot_reports
+    )
     manifest = {
         "schema_version": 1,
         "track": "A",
-        "corpus_kind": "parent_H_plus_targeted_part3_patch",
+        "corpus_kind": "parent_plus_targeted_part3_patch",
         "parent_corpus": str(parent_dir),
         "parent_manifest_sha256": _sha256(parent_manifest_path),
         "parent_manifest": parent_manifest.get("sources", {}),
@@ -193,9 +196,16 @@ def build(parent_dir: Path, pilot_dirs: list[Path], out_dir: Path, *, overwrite:
         "candidates_optimized": False,
         "contaminated": True,
         "contamination_note": (
-            "Train có Track C direct replay từ error catalog manual Part 3; chỉ dùng để vá WER "
-            "và assertion trên diagnostic/leaderboard, không dùng để kết luận generalization."
+            "Train có Track C được thiết kế từ error family của Part 3; "
+            + (
+                f"có {direct_replay_records} direct replay. "
+                if direct_replay_records else
+                "không có direct replay hay câu chép nguyên văn từ Part 3. "
+            )
+            + "Chỉ dùng để vá WER/assertion và không dùng local Part 3 để kết luận "
+              "generalization lên private test."
         ),
+        "direct_replay_records": direct_replay_records,
         "validation_test_policy": "copied_parent_byte_for_byte",
         "validation_sha256": _sha256(out_dir / "validation.jsonl"),
         "test_sha256": _sha256(out_dir / "test.jsonl"),

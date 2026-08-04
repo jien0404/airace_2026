@@ -42,6 +42,15 @@ class TrainingV2Test(unittest.TestCase):
         self.assertAlmostEqual(sum(weights[:2]), 0.10)
         self.assertAlmostEqual(sum(weights[2:]), 0.90)
 
+    def test_assertion_head_wrapper_accepts_multiple_prefixes(self):
+        rows = [
+            {"record_id": "old:a"}, {"record_id": "new:b"},
+            {"record_id": "base:a"}, {"record_id": "base:b"},
+        ]
+        weights = _sampler_weights(rows, ("old:", "new:"), 0.20)
+        self.assertAlmostEqual(sum(weights[:2]), 0.20)
+        self.assertAlmostEqual(sum(weights[2:]), 0.80)
+
     def test_targeted_sampler_control_and_multiple_profiles(self):
         rows = [
             {"record_id": "patch:type.1", "sample_weight": 2.0},
