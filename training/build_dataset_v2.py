@@ -17,7 +17,8 @@ TYPE_TO_ID = {typ: index + 1 for index, typ in enumerate(TYPES)}  # 0=None cho s
 def read_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
-    return [json.loads(line) for line in path.open(encoding="utf-8") if line.strip()]
+    with path.open(encoding="utf-8") as stream:
+        return [json.loads(line) for line in stream if line.strip()]
 
 
 def record_to_windows(
@@ -80,6 +81,7 @@ def record_to_windows(
             "genre": record.get("genre", "unknown"),
             "source": record.get("source", record.get("record_kind", "unknown")),
             "record_kind": record.get("record_kind", "unknown"),
+            "sampling_group": record.get("_sampling_group", "default"),
             "sample_weight": 1.0,
         })
     for index in range(len(record.get("entities") or [])):
@@ -98,6 +100,7 @@ def build_track(
     standalone_ratio: float,
     seed: int,
     gold_mass: float = 0.5,
+    source_masses: dict[str, float] | None = None,
 ) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "labels.txt").write_text("\n".join(LABELS), encoding="utf-8")
@@ -114,42 +117,62 @@ def build_track(
             windows.extend(built)
             report["coverage_errors"].extend(errors)
         if split == "train" and windows:
-            segment_indexes = [
-                index for index, row in enumerate(windows)
-                if row["record_kind"] == "segment"
-            ]
-            document_indexes = [
-                index for index, row in enumerate(windows)
-                if row["record_kind"] == "document"
-            ]
-            synthetic_mass = 1.0 - gold_mass
-            for indexes, mass in (
-                (segment_indexes, synthetic_mass * standalone_ratio),
-                (document_indexes, synthetic_mass * (1.0 - standalone_ratio)),
-            ):
-                if indexes:
-                    per_window = mass / len(indexes)
-                    for index in indexes:
-                        windows[index]["sample_weight"] = per_window
-            direct_part3_indexes = [
-                index for index, row in enumerate(windows)
-                if row["record_kind"].startswith("gold") and row["source"] == "part3"
-            ]
-            independent_gold_indexes = [
-                index for index, row in enumerate(windows)
-                if row["record_kind"].startswith("gold") and row["source"] != "part3"
-            ]
-            # C: Part 3 đúng 25% sampling mass; independent gold 25%; synthetic 50%.
-            # A/B không có direct Part 3 nên independent gold nhận trọn 50%.
-            direct_mass = gold_mass / 2 if direct_part3_indexes else 0.0
-            independent_mass = gold_mass - direct_mass
-            for indexes, mass in (
-                (independent_gold_indexes, independent_mass),
-                (direct_part3_indexes, direct_mass),
-            ):
-                if indexes:
+            if source_masses:
+                unknown_groups = {
+                    row["sampling_group"] for row in windows
+                } - set(source_masses)
+                if unknown_groups:
+                    raise RuntimeError(
+                        f"Thiếu source mass cho sampling group: {sorted(unknown_groups)}"
+                    )
+                if abs(sum(source_masses.values()) - 1.0) > 1e-9:
+                    raise RuntimeError("Tổng source_masses phải bằng 1")
+                for group, mass in source_masses.items():
+                    indexes = [
+                        index for index, row in enumerate(windows)
+                        if row["sampling_group"] == group
+                    ]
+                    if not indexes and mass > 0:
+                        raise RuntimeError(f"Sampling group {group!r} rỗng nhưng mass={mass}")
                     for index in indexes:
                         windows[index]["sample_weight"] = mass / len(indexes)
+            else:
+                segment_indexes = [
+                    index for index, row in enumerate(windows)
+                    if row["record_kind"] == "segment"
+                ]
+                document_indexes = [
+                    index for index, row in enumerate(windows)
+                    if row["record_kind"] == "document"
+                ]
+                synthetic_mass = 1.0 - gold_mass
+                for indexes, mass in (
+                    (segment_indexes, synthetic_mass * standalone_ratio),
+                    (document_indexes, synthetic_mass * (1.0 - standalone_ratio)),
+                ):
+                    if indexes:
+                        per_window = mass / len(indexes)
+                        for index in indexes:
+                            windows[index]["sample_weight"] = per_window
+                direct_part3_indexes = [
+                    index for index, row in enumerate(windows)
+                    if row["record_kind"].startswith("gold") and row["source"] == "part3"
+                ]
+                independent_gold_indexes = [
+                    index for index, row in enumerate(windows)
+                    if row["record_kind"].startswith("gold") and row["source"] != "part3"
+                ]
+                # C: Part 3 đúng 25% sampling mass; independent gold 25%; synthetic 50%.
+                # A/B không có direct Part 3 nên independent gold nhận trọn 50%.
+                direct_mass = gold_mass / 2 if direct_part3_indexes else 0.0
+                independent_mass = gold_mass - direct_mass
+                for indexes, mass in (
+                    (independent_gold_indexes, independent_mass),
+                    (direct_part3_indexes, direct_mass),
+                ):
+                    if indexes:
+                        for index in indexes:
+                            windows[index]["sample_weight"] = mass / len(indexes)
             total = sum(row["sample_weight"] for row in windows)
             scale = len(windows) / max(total, 1e-9)
             for row in windows:
@@ -184,7 +207,19 @@ def main():
              "Bỏ gt2 mà giữ 0.5 thì 249 cửa sổ part1 bị lặp ~14 lần mỗi epoch.",
     )
     parser.add_argument("--seed", type=int, default=20260730)
+    parser.add_argument(
+        "--source-mass", action="append", default=[], metavar="GROUP=FLOAT",
+        help="Override sampler mass theo record._sampling_group; phải cấp đủ group và tổng=1",
+    )
     args = parser.parse_args()
+    source_masses = None
+    if args.source_mass:
+        source_masses = {}
+        for spec in args.source_mass:
+            group, separator, value = spec.partition("=")
+            if not separator or not group:
+                parser.error(f"--source-mass không hợp lệ: {spec!r}")
+            source_masses[group] = float(value)
     for track in [value.strip().upper() for value in args.tracks.split(",")]:
         report = build_track(
             Path(args.dataset_root) / f"track_{track.lower()}",
@@ -196,6 +231,7 @@ def main():
             args.standalone_ratio,
             args.seed,
             args.gold_mass,
+            source_masses,
         )
         print(
             f"[{track}] "

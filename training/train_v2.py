@@ -304,6 +304,10 @@ def main():
         "--save-every-epoch", action="store_true",
         help="Lưu thêm epoch-XXX để phân tích warm-start, ngoài checkpoint best",
     )
+    parser.add_argument(
+        "--save-last", action="store_true",
+        help="Lưu checkpoint last sau đúng số epoch; dùng cho private refit theo epoch đã chọn",
+    )
     parser.add_argument("--seed", type=int, default=20260730)
     args = parser.parse_args()
     if not args.model and not args.init_checkpoint:
@@ -399,6 +403,8 @@ def main():
     )
     scaler = torch.amp.GradScaler("cuda", enabled=args.fp16 and device == "cuda")
     best = -1.0
+    best_epoch = 0
+    last_metrics: dict = {}
     os.makedirs(args.out, exist_ok=True)
     run_report = {
         "schema_version": 1,
@@ -450,11 +456,17 @@ def main():
         metrics = evaluate(model, validation_loader, id_to_label, device)
         print(f"[epoch {epoch + 1}] {json.dumps(metrics)}", flush=True)
         run_report["history"].append({"epoch": epoch + 1, **metrics})
+        last_metrics = metrics
         if args.save_every_epoch:
             save_checkpoint(args.out + f"/epoch-{epoch + 1:03d}", epoch + 1, metrics)
         if metrics["selection_score"] > best:
             best = metrics["selection_score"]
+            best_epoch = epoch + 1
             save_checkpoint(args.out + "/best", epoch + 1, metrics)
+    if args.save_last:
+        save_checkpoint(args.out + "/last", int(math.ceil(args.epochs)), last_metrics)
+    run_report["best_epoch"] = best_epoch
+    run_report["best_selection_score"] = best
     (Path(args.out) / "training_report.json").write_text(
         json.dumps(run_report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
