@@ -18,7 +18,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterable
 
-from business_rules.artifacts import current_labels_zip
+from business_rules.artifacts import current_labels_zip, manifest as artifact_manifest
 from training.assertion_policy import filter_assertions
 from training.build_dataset_v2 import build_track, record_to_windows
 from training.build_ner_corpus import load_labeled_dir, load_part3
@@ -72,6 +72,20 @@ VARIANTS = {
         },
     },
 }
+
+
+def variant_specs(suffix: str = "") -> dict[str, dict[str, Any]]:
+    """Return artifact names, optionally inserting a version suffix in Final N names."""
+    if not suffix:
+        return deepcopy(VARIANTS)
+    marker = f"final_generalization_{suffix}"
+    output = {}
+    for key, spec in VARIANTS.items():
+        item = deepcopy(spec)
+        item["raw"] = item["raw"].replace("final_generalization", marker)
+        item["windows"] = item["windows"].replace("final_generalization", marker)
+        output[key] = item
+    return output
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -266,11 +280,22 @@ def build_corpora(
     augment_dir: Path = AUGMENT_DIR,
     independent_augment_dir: Path = INDEPENDENT_AUGMENT_DIR,
     datasets_dir: Path = ROOT / "datasets",
+    variants: dict[str, dict[str, Any]] | None = None,
+    summary_name: str = "final_n_build_summary.json",
 ) -> dict[str, Any]:
     broad = read_jsonl(source_dir / "broad_h.jsonl")
     broad_independent = read_jsonl(source_dir / "broad_independent.jsonl")
     analogues = read_jsonl(source_dir / "selected_analogues.jsonl")
-    llm = [sanitize(row) for row in read_jsonl(LLM_SOURCE)]
+    # The source bank is versioned together with the artifact/data update.  Do
+    # not silently fall back to the old global source when ``--source-dir`` is
+    # a new directory; that would make the manifest claim one source bank while
+    # the records came from another one.
+    llm_source = source_dir / "final_llm_generalization.jsonl"
+    if not llm_source.exists():
+        raise FileNotFoundError(
+            f"Thiếu final_llm_generalization.jsonl trong source bank: {llm_source}"
+        )
+    llm = [sanitize(row) for row in read_jsonl(llm_source)]
     for row in llm:
         row["_sampling_group"] = "final_llm"
     augment = [sanitize(row) for row in read_jsonl(augment_dir / "augment.jsonl")]
@@ -298,7 +323,7 @@ def build_corpora(
     part3_validation, part3_train = _split(part3, 20, "part3-validation")
 
     outputs = {}
-    for key, spec in VARIANTS.items():
+    for key, spec in (variants or VARIANTS).items():
         if key == "n1":
             train = (
                 _tag(part1 + part2_train, "official_independent")
@@ -345,11 +370,18 @@ def build_corpora(
             "splits": {name: _describe(rows) for name, rows in splits.items()},
             "source_sha256": {
                 "broad": sha256(source_dir / "broad_h.jsonl"),
-                "llm": sha256(LLM_SOURCE),
+                "llm": sha256(llm_source),
                 "augment": sha256(augment_dir / "augment.jsonl"),
                 "analogues": sha256(source_dir / "selected_analogues.jsonl"),
                 "part3_labels": sha256(current_labels_zip()),
+                "part1_part2_label_manifest": sha256(
+                    ROOT / "annotation/data/label_final/manifest.json"
+                ),
             },
+            "part3_artifact": artifact_manifest()["current"],
+            "augment_manifest": str(
+                (independent_augment_dir if key == "n1" else augment_dir) / "manifest.json"
+            ),
         }
         if key == "n1":
             manifest["source_sha256"]["broad"] = sha256(
@@ -388,7 +420,7 @@ def build_corpora(
                 if path.is_file():
                     archive.write(path, path.relative_to(datasets_dir / spec["windows"]))
         outputs[key] = {"manifest": manifest, "build_report": report, "zip": str(zip_path)}
-    summary_path = datasets_dir / "final_n_build_summary.json"
+    summary_path = datasets_dir / summary_name
     summary_path.write_text(json.dumps(outputs, ensure_ascii=False, indent=2), encoding="utf-8")
     return outputs
 
@@ -405,6 +437,10 @@ def main() -> int:
         "--independent-augment-dir", type=Path, default=INDEPENDENT_AUGMENT_DIR,
     )
     corpora.add_argument("--datasets-dir", type=Path, default=ROOT / "datasets")
+    corpora.add_argument(
+        "--variant-suffix", default="",
+        help="suffix chen vao final_generalization trong ten artifact, vi du v2",
+    )
     args = parser.parse_args()
     if args.command == "prepare-sources":
         result = prepare_sources(args.out.resolve())
@@ -412,6 +448,11 @@ def main() -> int:
         result = build_corpora(
             args.source_dir.resolve(), args.augment_dir.resolve(),
             args.independent_augment_dir.resolve(), args.datasets_dir.resolve(),
+            variants=variant_specs(args.variant_suffix),
+            summary_name=(
+                "final_n_build_summary.json"
+                if not args.variant_suffix else f"final_n_build_summary_{args.variant_suffix}.json"
+            ),
         )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
