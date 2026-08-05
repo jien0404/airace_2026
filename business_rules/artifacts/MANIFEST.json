@@ -1,0 +1,37 @@
+{
+ "schema_version": 1,
+ "updated": "2026-08-04",
+ "current": {
+  "name": "v67_patient_grounded_transfer12_p6b_20260804",
+  "path": "business_rules/artifacts/current/v67_patient_grounded_transfer12_p6b_20260804.zip",
+  "sha256": "e803003cee5a43d740bf4024e65b82d7a6a7214389e3338c0d83352333959b9b",
+  "score_expected": null,
+  "score_note": "Winner patient-grounded transfer12/p6b được chọn làm artifact Part 3 mới; metric không nằm trong ZIP nên chưa ghi điểm kỳ vọng. Bản v66ab cũ đã được giữ trong archive và backup.",
+  "files": 100,
+  "raw_characters": 203817,
+  "entities": 2743,
+  "candidates": 500,
+  "entities_with_assertion": 413,
+  "spans_with_newline": 14,
+  "by_type": {
+   "CHẨN_ĐOÁN": 697,
+   "TÊN_XÉT_NGHIỆM": 431,
+   "THUỐC": 269,
+   "TRIỆU_CHỨNG": 1069,
+   "KẾT_QUẢ_XÉT_NGHIỆM": 277
+  }
+ },
+ "primary_rulebook": {
+  "path": "business_rules/sources/PART3_RULEBOOK_V20_TO_V66.md",
+  "sha256": "d92c873a1be17a6d71d7dbadc89e030dd3877062e90f847bfedca55d917932de"
+ },
+ "archive": [
+  "business_rules/artifacts/archive/v67_patient_grounded_transfer12_p6b_20260804.zip",
+  "business_rules/artifacts/archive/contextual_icd_three_signal_probe.zip",
+  "business_rules/artifacts/archive/v66ab_hyperbilirubinemia_plus_alopecia_winners.zip",
+  "business_rules/artifacts/archive/v13_cumulative_winners_v01_v04.zip",
+  "business_rules/artifacts/archive/v19_cumulative_confirmed_winners.zip",
+  "business_rules/artifacts/archive/v24abcd_cumulative_repeat_consistency.zip",
+  "business_rules/artifacts/archive/v42a_generalized_v41c_rules.zip"
+ ]
+}
