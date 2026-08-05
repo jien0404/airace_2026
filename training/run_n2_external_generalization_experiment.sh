@@ -11,14 +11,31 @@ DATA="datasets/ner_N2_v3_v67_tb256_ok45_windows_20260805/track_a"
 PART3_INPUT="${PART3_INPUT:-input_turn2}"
 EXTERNAL_NOTES="${EXTERNAL_NOTES:-annotation/data/external_benhvien108_qa_v1/notes}"
 RUN="runs/part3_n2_tb256_large_balanced_20260805"
+TRAIN_ONLY="${N2_TRAIN_ONLY:-0}"
+SKIP_ARTIFACT_PROVENANCE="${SKIP_ARTIFACT_PROVENANCE:-0}"
 
-for required in "$DATA/train.jsonl" "$DATA/raw_validation.jsonl" "$PART3_INPUT" "$EXTERNAL_NOTES"
+for required in "$DATA/train.jsonl" "$DATA/raw_validation.jsonl"
 do
   if [[ ! -e "$required" ]]; then
     echo "Thiếu đầu vào: $required" >&2
     exit 2
   fi
 done
+
+if [[ "$TRAIN_ONLY" != "1" ]]; then
+  for required in "$PART3_INPUT" "$EXTERNAL_NOTES"
+  do
+    if [[ ! -e "$required" ]]; then
+      echo "Thiếu đầu vào infer: $required" >&2
+      exit 2
+    fi
+  done
+fi
+
+PROVENANCE_ARGS=(--require-provenance --require-dataset-variant n2)
+if [[ "$SKIP_ARTIFACT_PROVENANCE" != "1" ]]; then
+  PROVENANCE_ARGS+=(--require-part3-sha256 "$SHA")
+fi
 
 python -m training.train_v2 \
   --data "$DATA" \
@@ -38,10 +55,13 @@ python -m training.train_v2 \
   --early-stopping-patience 5 \
   --prefix-subword-cap 64 \
   --eval-overlap-words 45 \
-  --require-provenance \
-  --require-dataset-variant n2 \
-  --require-part3-sha256 "$SHA" \
+  "${PROVENANCE_ARGS[@]}" \
   --fp16
+
+if [[ "$TRAIN_ONLY" == "1" ]]; then
+  echo "Hoàn tất N2 training-only: $RUN"
+  exit 0
+fi
 
 predict() {
   local input="$1"
@@ -91,4 +111,3 @@ python -m annotation.external_challenge.stage_prediction_view \
   --name n2_tb_recall_h055 --overwrite
 
 echo "Hoàn tất N2 balanced và ba probe external 108. Chưa train N3."
-
