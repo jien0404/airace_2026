@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "part3_rule_prompt_eval_v1_10files",
+  "selected_files": [3, 5, 11, 22, 24, 31, 32, 36, 65, 92],
+  "selection_method": {
+    "summary": "Chọn các file có nhiều thao tác nghiệp vụ trong lịch sử và nhiều thay đổi giữa các artifact; bổ sung file 65 để phủ winner V66b.",
+    "ranking_formula": "3 * non-CODE diffs(current vs archived artifacts) + historical ops + 2 * ops in positive-delta lots",
+    "notes": [
+      "Các file 3, 5, 11, 22, 24, 32, 36 nằm trong nhóm cao nhất theo công thức.",
+      "File 31 được giữ vì tập trung boundary, tên xét nghiệm, ASR và candidate.",
+      "File 92 được giữ vì có nhiều candidate và concept lặp.",
+      "File 65 được chọn có chủ đích để phủ rụng tóc toàn bộ/toàn thể của V66b.",
+      "File 22 đồng thời phủ tăng bilirubin máu của V66a."
+    ]
+  },
+  "file_reasons": {
+    "3": "Nội dung tư vấn/giáo dục, type theo occurrence, trim ASR và candidate rỗng.",
+    "5": "Patient-grounding, cụm mô tả/tế bào bất thường, occurrence lặp và false positive.",
+    "11": "Type chẩn đoán, candidate rỗng và finding hình ảnh lặp.",
+    "22": "Boundary triệu chứng lặp, xét nghiệm bilirubin và winner candidate V66a.",
+    "24": "Negation, historical symptom, thuốc/truyền tĩnh mạch và formulation.",
+    "31": "Trim modifier, tên xét nghiệm, ERCP, ASR lặp và candidate.",
+    "32": "Split compound, negation, assertion thuốc, CKD, amyloidosis và candidate.",
+    "36": "Imaging narrative, tên xét nghiệm, finding, boundary và candidate.",
+    "65": "Văn bản giáo dục, tên nhóm/thuốc bị che, type theo occurrence và winner V66b.",
+    "92": "Diagnosis lặp, candidate rỗng và consistency giữa nhiều occurrence."
+  },
+  "variants": [
+    "official_only",
+    "canonical_dump",
+    "compiled",
+    "compiled_verified"
+  ],
+  "submission_prefix": "labels",
+  "outside_subset_policy": "empty_list"
+}
+
