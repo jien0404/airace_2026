@@ -161,6 +161,11 @@ def score(
             )
             for name, counts in assertion.items()
         },
+        "assertion_micro_on_matched": _prf(
+            sum(counts["tp"] for counts in assertion.values()),
+            sum(counts["tp"] + counts["fp"] for counts in assertion.values()),
+            sum(counts["tp"] + counts["fn"] for counts in assertion.values()),
+        ),
     }
     return report
 

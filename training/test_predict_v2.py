@@ -5,8 +5,11 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from training.predict_v2 import encoder_capacity, _encode_words, _merge_predictions
+from training.predict_v2 import (
+    encoder_capacity, _encode_words, _merge_predictions, _threshold_for_type,
+)
 from training.assertion_policy import (
+    apply_optional_historical_education_firewall,
     apply_policy_to_predictions,
     assertions_from_probabilities,
     postprocess_zip,
@@ -34,8 +37,32 @@ class Cap(unittest.TestCase):
         self.assertEqual(limit, len(first))
         self.assertTrue(all(i < len(ids) for i in first + last))
 
+    def test_type_specific_ner_threshold(self):
+        mapping = {"TRIỆU_CHỨNG": 0.72}
+        self.assertEqual(_threshold_for_type(0.60, mapping, "TRIỆU_CHỨNG"), 0.72)
+        self.assertEqual(_threshold_for_type(0.60, mapping, "THUỐC"), 0.60)
+        with self.assertRaises(ValueError):
+            _threshold_for_type(0.60, {"THUỐC": 1.2}, "THUỐC")
+
 
 class AssertionPolicyTest(unittest.TestCase):
+    def test_historical_education_firewall_is_explicit_and_patient_safe(self):
+        entity = [{
+            "text": "tăng huyết áp", "position": [28, 41],
+            "type": "CHẨN_ĐOÁN", "assertions": ["isHistorical"], "candidates": [],
+        }]
+        generic = "Các nguyên nhân thường gặp: tăng huyết áp và rối loạn lipid."
+        start = generic.index("tăng huyết áp")
+        entity[0]["position"] = [start, start + len("tăng huyết áp")]
+        filtered, stats = apply_optional_historical_education_firewall(generic, entity)
+        self.assertEqual(filtered[0]["assertions"], [])
+        self.assertEqual(stats["removed_historical_education"], 1)
+        patient = "Bệnh nhân có tiền sử tăng huyết áp."
+        start = patient.index("tăng huyết áp")
+        entity[0]["position"] = [start, start + len("tăng huyết áp")]
+        kept, _ = apply_optional_historical_education_firewall(patient, entity)
+        self.assertEqual(kept[0]["assertions"], ["isHistorical"])
+
     def test_part3_firewall(self):
         rows = [{
             "text": "bệnh",

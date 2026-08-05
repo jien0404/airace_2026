@@ -11,6 +11,7 @@ import torch
 from .schema_v2 import ASSERTION_TYPES
 from .assertion_policy import (
     POLICIES,
+    apply_optional_historical_education_firewall,
     assertions_from_probabilities,
     load_type_thresholds,
     resolve_thresholds,
@@ -83,6 +84,7 @@ def _merge_predictions(
     assertion_policy,
     assertion_aggregation="selected",
     assertion_type_thresholds=None,
+    keep_diagnostics=False,
 ):
     """Gộp output các cửa sổ và chốt assertion sau khi gộp.
 
@@ -143,8 +145,21 @@ def _merge_predictions(
             )
         else:
             entity["assertions"] = []
-        entity.pop("_confidence", None)
+        if keep_diagnostics:
+            entity["_assertion_probabilities"] = probabilities
+        else:
+            for key in tuple(entity):
+                if key.startswith("_"):
+                    entity.pop(key, None)
     return chosen
+
+
+def _threshold_for_type(default: float, mapping: dict | None, entity_type: str) -> float:
+    value = (mapping or {}).get(entity_type, default)
+    value = float(value)
+    if not 0 <= value <= 1:
+        raise ValueError(f"Threshold {entity_type} phải nằm trong [0,1], nhận {value}")
+    return value
 
 
 @torch.no_grad()
@@ -164,6 +179,11 @@ def predict_text(
     assertion_type_thresholds=None,
     assertion_policy="part3",
     assertion_aggregation="selected",
+    ner_type_thresholds=None,
+    prefix_subword_cap=64,
+    tokenizer_aware_windows=True,
+    keep_diagnostics=False,
+    historical_education_firewall=False,
 ):
     labels = meta["labels"]
     types = meta["types"]
@@ -179,7 +199,12 @@ def predict_text(
         assertion_threshold, assertion_thresholds
     )
     predictions = []
-    for window in sliding_windows(text, max_words, overlap_words, include_header=True):
+    for window in sliding_windows(
+        text, max_words, overlap_words, include_header=True,
+        tokenizer=tokenizer if tokenizer_aware_windows else None,
+        max_len=max_len if tokenizer_aware_windows else None,
+        prefix_subword_cap=prefix_subword_cap,
+    ):
         prefix, content = window["prefix"], window["content"]
         words = [token for token, _, _ in prefix + content]
         input_ids, first, last, word_limit = _encode_words(
@@ -218,23 +243,34 @@ def predict_text(
             span_type_id = int(span_probabilities[index].argmax())
             span_confidence = float(span_probabilities[index, span_type_id])
             bio_type = candidate["type"]
+            veto_threshold = _threshold_for_type(
+                type_threshold, (ner_type_thresholds or {}).get("span_veto"), bio_type
+            )
+            disagreement_gate = _threshold_for_type(
+                disagreement_threshold,
+                (ner_type_thresholds or {}).get("disagreement"),
+                bio_type,
+            )
             if span_type_id == 0:
-                if span_confidence >= type_threshold:
+                if span_confidence >= veto_threshold:
                     continue
                 final_type = bio_type
                 confidence = candidate["bio_confidence"]
+                decision = "bio_overrode_span_none"
             else:
                 span_type = types[span_type_id - 1]
                 if span_type == bio_type:
                     final_type = bio_type
                     confidence = (candidate["bio_confidence"] + span_confidence) / 2
+                    decision = "heads_agree"
                 else:
-                    if max(candidate["bio_confidence"], span_confidence) < disagreement_threshold:
+                    if max(candidate["bio_confidence"], span_confidence) < disagreement_gate:
                         continue
                     final_type = (
                         span_type if span_confidence > candidate["bio_confidence"] else bio_type
                     )
                     confidence = max(candidate["bio_confidence"], span_confidence)
+                    decision = "high_confidence_head_wins"
             start, end = candidate["position"]
             assertion_probabilities_for_entity = []
             if final_type in ASSERTION_TYPES:
@@ -250,17 +286,25 @@ def predict_text(
                 "candidates": [],
                 "_confidence": confidence,
                 "_assertion_probabilities": assertion_probabilities_for_entity,
+                "_bio_confidence": candidate["bio_confidence"],
+                "_span_confidence": span_confidence,
+                "_span_type": None if span_type_id == 0 else types[span_type_id - 1],
+                "_decision": decision,
             })
     # Hợp nhất overlap từ sliding windows. Same span/type giữ confidence cao nhất;
     # khác span cạnh tranh thì ưu tiên confidence cao, sau đó span dài hơn.
-    return _merge_predictions(
+    merged = _merge_predictions(
         predictions,
         assertions,
         per_assertion_thresholds,
         assertion_policy,
         assertion_aggregation,
         assertion_type_thresholds,
+        keep_diagnostics,
     )
+    if historical_education_firewall:
+        merged, _ = apply_optional_historical_education_firewall(text, merged)
+    return merged
 
 
 def main():
@@ -274,6 +318,11 @@ def main():
     )
     parser.add_argument("--max-words", type=int, default=180)
     parser.add_argument("--overlap-words", type=int, default=45)
+    parser.add_argument("--prefix-subword-cap", type=int, default=64)
+    parser.add_argument(
+        "--legacy-word-windows", action="store_true",
+        help="Giữ cắt 180 từ rồi truncate như luồng cũ; chỉ dùng để ablation",
+    )
     parser.add_argument("--type-threshold", type=float, default=0.60)
     parser.add_argument("--disagreement-threshold", type=float, default=0.85)
     parser.add_argument("--assertion-threshold", type=float, default=0.60)
@@ -297,6 +346,21 @@ def main():
         ),
     )
     parser.add_argument(
+        "--ner-threshold-map",
+        help=(
+            "JSON threshold theo type cho span_veto/disagreement; ví dụ "
+            "{span_veto: {TRIỆU_CHỨNG: 0.65}, disagreement: {...}}"
+        ),
+    )
+    parser.add_argument(
+        "--confidence-out",
+        help="Thư mục sidecar confidence phục vụ calibration/audit; không đổi JSON nộp bài",
+    )
+    parser.add_argument(
+        "--historical-education-firewall", action="store_true",
+        help="Rule thử nghiệm, mặc định TẮT; chỉ bật sau gate v67 + external reviewed",
+    )
+    parser.add_argument(
         "--assertion-policy", choices=POLICIES, default="part3",
         help="part3 áp firewall đã được probe xác nhận; legacy giữ output model nguyên trạng",
     )
@@ -309,6 +373,14 @@ def main():
         load_type_thresholds(Path(args.assertion_threshold_map))
         if args.assertion_threshold_map else {}
     )
+    ner_type_thresholds = {}
+    if args.ner_threshold_map:
+        ner_type_thresholds = json.loads(
+            Path(args.ner_threshold_map).read_text(encoding="utf-8")
+        )
+        unknown = set(ner_type_thresholds) - {"span_veto", "disagreement"}
+        if unknown:
+            parser.error(f"Nhóm threshold NER không hợp lệ: {sorted(unknown)}")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     from transformers import AutoTokenizer
     try:
@@ -322,6 +394,8 @@ def main():
         print(f"[cảnh báo] max_len={max_len} vượt sức chứa encoder; hạ về {capacity}")
         max_len = capacity
     os.makedirs(args.out_dir, exist_ok=True)
+    if args.confidence_out:
+        os.makedirs(args.confidence_out, exist_ok=True)
     files = sorted(
         glob.glob(os.path.join(args.input_dir, "*.txt")),
         key=lambda path: int(Path(path).stem) if Path(path).stem.isdigit() else Path(path).stem,
@@ -344,7 +418,36 @@ def main():
             assertion_type_thresholds=assertion_type_thresholds,
             assertion_policy=args.assertion_policy,
             assertion_aggregation=args.assertion_aggregation,
+            ner_type_thresholds=ner_type_thresholds,
+            prefix_subword_cap=args.prefix_subword_cap,
+            tokenizer_aware_windows=not args.legacy_word_windows,
+            keep_diagnostics=bool(args.confidence_out),
+            historical_education_firewall=args.historical_education_firewall,
         )
+        if args.confidence_out:
+            diagnostics = []
+            for entity in entities:
+                diagnostics.append({
+                    "text": entity["text"],
+                    "position": entity["position"],
+                    "type": entity["type"],
+                    "assertions": entity["assertions"],
+                    "final_confidence": entity.get("_confidence"),
+                    "bio_confidence": entity.get("_bio_confidence"),
+                    "span_confidence": entity.get("_span_confidence"),
+                    "span_type": entity.get("_span_type"),
+                    "decision": entity.get("_decision"),
+                    "assertion_probabilities": dict(zip(
+                        meta.get("assertions") or [],
+                        entity.get("_assertion_probabilities", []),
+                    )),
+                })
+                for key in tuple(entity):
+                    if key.startswith("_"):
+                        entity.pop(key, None)
+            (Path(args.confidence_out) / f"{Path(path).stem}.json").write_text(
+                json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
         (Path(args.out_dir) / f"{Path(path).stem}.json").write_text(
             json.dumps(entities, ensure_ascii=False, indent=2), encoding="utf-8"
         )

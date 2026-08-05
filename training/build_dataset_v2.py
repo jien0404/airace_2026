@@ -3,11 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import shutil
 from pathlib import Path
 
 from .schema_v2 import ASSERTIONS, ASSERTION_TYPES, TYPES
 
-from .windowing_v2 import entity_word_span, sliding_windows
+from .windowing_v2 import entity_centered_window, entity_word_span, sliding_windows
 
 LABELS = ["O"] + [f"{prefix}-{typ}" for typ in TYPES for prefix in ("B", "I")]
 LABEL_TO_ID = {label: index for index, label in enumerate(LABELS)}
@@ -28,14 +29,36 @@ def record_to_windows(
     header_dropout: float,
     o_keep: float,
     seed: int,
+    tokenizer=None,
+    max_len: int = 256,
+    prefix_subword_cap: int = 64,
+    subword_cache: dict[str, int] | None = None,
 ) -> tuple[list[dict], list[str]]:
     rng = random.Random(f"{seed}:{record['id']}")
     include_header = rng.random() >= header_dropout
     output, errors = [], []
     covered = set()
-    for window_index, window in enumerate(sliding_windows(
-        record["text"], max_words, overlap_words, include_header
-    )):
+    normal_windows = sliding_windows(
+        record["text"], max_words, overlap_words, include_header,
+        tokenizer=tokenizer, max_len=max_len, prefix_subword_cap=prefix_subword_cap,
+        subword_cache=subword_cache,
+    )
+    all_windows = list(normal_windows)
+    if tokenizer is not None:
+        for entity in record.get("entities") or []:
+            if any(
+                entity_word_span(window["content"], *entity["position"]) is not None
+                for window in normal_windows
+            ):
+                continue
+            rescue = entity_centered_window(
+                record["text"], entity["position"], tokenizer,
+                max_len=max_len, max_words=max_words,
+                subword_cache=subword_cache,
+            )
+            if rescue is not None:
+                all_windows.append(rescue)
+    for window_index, window in enumerate(all_windows):
         prefix = window["prefix"]
         content = window["content"]
         tokens = prefix + content
@@ -83,6 +106,8 @@ def record_to_windows(
             "record_kind": record.get("record_kind", "unknown"),
             "sampling_group": record.get("_sampling_group", "default"),
             "sample_weight": 1.0,
+            "subword_length": window.get("subword_length"),
+            "coverage_rescue": bool(window.get("coverage_rescue")),
         })
     for index in range(len(record.get("entities") or [])):
         if index not in covered:
@@ -101,18 +126,35 @@ def build_track(
     seed: int,
     gold_mass: float = 0.5,
     source_masses: dict[str, float] | None = None,
+    tokenizer=None,
+    max_len: int = 256,
+    prefix_subword_cap: int = 64,
 ) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "labels.txt").write_text("\n".join(LABELS), encoding="utf-8")
     (out_dir / "types.txt").write_text("\n".join(TYPES), encoding="utf-8")
     (out_dir / "assertions.txt").write_text("\n".join(ASSERTIONS), encoding="utf-8")
-    report = {"splits": {}, "coverage_errors": []}
+    report = {
+        "schema_version": 2,
+        "raw_dataset_root": str(dataset_dir.resolve()),
+        "tokenizer_aware": tokenizer is not None,
+        "windowing": {
+            "max_words": max_words,
+            "overlap_words": overlap_words,
+            "max_len": max_len if tokenizer is not None else None,
+            "prefix_subword_cap": prefix_subword_cap if tokenizer is not None else None,
+        },
+        "splits": {},
+        "coverage_errors": [],
+    }
+    subword_cache: dict[str, int] = {}
     for split in ("train", "validation", "test"):
         records = read_jsonl(dataset_dir / f"{split}.jsonl")
         windows = []
         for record in records:
             built, errors = record_to_windows(
-                record, max_words, overlap_words, header_dropout, o_keep, seed
+                record, max_words, overlap_words, header_dropout, o_keep, seed,
+                tokenizer, max_len, prefix_subword_cap, subword_cache,
             )
             windows.extend(built)
             report["coverage_errors"].extend(errors)
@@ -184,10 +226,27 @@ def build_track(
             "records": len(records),
             "windows": len(windows),
             "entities": sum(len(window["spans"]) for window in windows),
+            "max_subword_length": max(
+                (row.get("subword_length") or 0 for row in windows), default=0
+            ),
+            "subword_overflow_windows": sum(
+                (row.get("subword_length") or 0) > max_len for row in windows
+            ) if tokenizer is not None else None,
+            "coverage_rescue_windows": sum(
+                bool(row.get("coverage_rescue")) for row in windows
+            ),
         }
     (out_dir / "build_report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    if (dataset_dir / "manifest.json").is_file():
+        shutil.copy2(dataset_dir / "manifest.json", out_dir / "manifest.json")
+    # Raw document-level validation is required to select checkpoints with the same merge and
+    # overlap scorer as inference.  Keep it inside the portable window archive.
+    for split in ("validation", "test"):
+        source = dataset_dir / f"{split}.jsonl"
+        if source.is_file():
+            shutil.copy2(source, out_dir / f"raw_{split}.jsonl")
     return report
 
 
@@ -198,6 +257,12 @@ def main():
     parser.add_argument("--tracks", default="A,B,C")
     parser.add_argument("--max-words", type=int, default=180)
     parser.add_argument("--overlap-words", type=int, default=45)
+    parser.add_argument(
+        "--tokenizer",
+        help="Tokenizer HF/checkpoint; bật window theo ngân sách subword dùng chung với infer",
+    )
+    parser.add_argument("--max-len", type=int, default=256)
+    parser.add_argument("--prefix-subword-cap", type=int, default=64)
     parser.add_argument("--header-dropout", type=float, default=0.35)
     parser.add_argument("--o-keep", type=float, default=0.35)
     parser.add_argument("--standalone-ratio", type=float, default=0.60)
@@ -212,6 +277,13 @@ def main():
         help="Override sampler mass theo record._sampling_group; phải cấp đủ group và tổng=1",
     )
     args = parser.parse_args()
+    tokenizer = None
+    if args.tokenizer:
+        from transformers import AutoTokenizer
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
+        except Exception:
+            tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=False)
     source_masses = None
     if args.source_mass:
         source_masses = {}
@@ -232,6 +304,9 @@ def main():
             args.seed,
             args.gold_mass,
             source_masses,
+            tokenizer,
+            args.max_len,
+            args.prefix_subword_cap,
         )
         print(
             f"[{track}] "

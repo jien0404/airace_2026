@@ -2,6 +2,13 @@
 
 ## Pipeline v2 hiện hành
 
+> Luồng tối ưu cuối tokenizer-budget + XLM-R-large, provenance gate và ba run được đóng băng
+> tại [`FINAL_TOKENBUDGET_LARGE_OPTIMIZATION_20260805.md`](../business_rules/FINAL_TOKENBUDGET_LARGE_OPTIMIZATION_20260805.md).
+> Luồng này chỉ tối ưu NER/WER + assertion, tuyệt đối không tối ưu candidates.
+
+> Quyết định mới nhất bỏ N1 và dùng đúng một N2 experiment trước khi chốt N3 nằm tại
+> [`N2_TO_N3_EXTERNAL_GENERALIZATION_20260805.md`](../business_rules/N2_TO_N3_EXTERNAL_GENERALIZATION_20260805.md).
+
 Phần còn lại của README mô tả lịch sử model v1. Batch mới dùng dataset từ
 [`dataset_factory`](../dataset_factory/README.md) và model hybrid:
 

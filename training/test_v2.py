@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +12,10 @@ from .audit_token_budget import audit_rows
 from .model_v2 import HybridNER
 from .train_assertion_head import _sampler_weights
 from .train_v2 import targeted_sampler_weights
-from .windowing_v2 import coverage_errors, sliding_windows, tokenize_raw
+from .provenance import verify_dataset
+from .windowing_v2 import (
+    coverage_errors, entity_centered_window, entity_word_span, sliding_windows, tokenize_raw,
+)
 
 
 class DummyEncoder(nn.Module):
@@ -130,6 +134,49 @@ class TrainingV2Test(unittest.TestCase):
             coverage_errors(text, [entity], max_words=15, overlap_words=5),
             [],
         )
+
+    def test_tokenizer_budget_windows_are_gap_free_on_1823_words(self):
+        text = " ".join("long" if index % 7 == 0 else f"t{index}" for index in range(1823))
+        raw_tokens = tokenize_raw(text)
+        windows = sliding_windows(
+            text,
+            max_words=180,
+            overlap_words=45,
+            tokenizer=DummyTokenizer(),
+            max_len=256,
+            prefix_subword_cap=64,
+        )
+        self.assertTrue(windows)
+        self.assertTrue(all(window["subword_length"] <= 256 for window in windows))
+        covered = set()
+        for window in windows:
+            start = window["word_start"]
+            covered.update(range(start, start + len(window["content"])))
+        self.assertEqual(covered, set(range(len(raw_tokens))))
+
+    def test_entity_centered_rescue_keeps_long_gold_within_budget(self):
+        text = " ".join(f"t{i}" for i in range(260))
+        tokens = tokenize_raw(text)
+        position = [tokens[120][1], tokens[220][2]]
+        rescue = entity_centered_window(
+            text, position, DummyTokenizer(), max_len=256, max_words=180
+        )
+        self.assertIsNotNone(rescue)
+        self.assertLessEqual(rescue["subword_length"], 256)
+        self.assertIsNotNone(entity_word_span(rescue["content"], *position))
+
+    def test_provenance_rejects_wrong_dataset_variant_before_training(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for split in ("train", "validation", "test"):
+                (root / f"{split}.jsonl").write_text("{}\n", encoding="utf-8")
+            (root / "manifest.json").write_text(
+                json.dumps({"variant": "legacy_v1"}), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RuntimeError, "Sai dataset variant"):
+                verify_dataset(
+                    root, require_manifest=True, allowed_variants=("n1", "n3")
+                )
 
     def test_hybrid_model_shapes_and_loss(self):
         model = HybridNER("dummy", 11, encoder=DummyEncoder())

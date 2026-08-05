@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import re
 import zipfile
 from collections import Counter
 from pathlib import Path
@@ -26,6 +27,14 @@ from typing import Any, Iterable, Mapping, Sequence
 from .schema_v2 import ASSERTIONS, ASSERTION_TYPES
 
 POLICIES = ("legacy", "part3")
+EDUCATION_CUE_RE = re.compile(
+    r"(?:nguyên nhân|thường gặp|có thể gặp|biểu hiện|dấu hiệu|yếu tố nguy cơ|"
+    r"được định nghĩa|là gì|phòng ngừa)", re.IGNORECASE,
+)
+PATIENT_GROUNDING_RE = re.compile(
+    r"(?:bệnh nhân|người bệnh|người nhà|tôi|em|cháu|tiền sử|đã từng|"
+    r"trước nhập viện|đợt trước|lần khám trước)", re.IGNORECASE,
+)
 
 
 def resolve_thresholds(
@@ -139,6 +148,31 @@ def apply_policy_to_predictions(
                 if name not in after:
                     stats[f"removed:{entity.get('type')}:{name}"] += 1
             entity["assertions"] = after
+    return output, stats
+
+
+def apply_optional_historical_education_firewall(
+    text: str, rows: list[dict], context_characters: int = 240,
+) -> tuple[list[dict], Counter]:
+    """Remove historical only in clearly generic educational context.
+
+    This rule is intentionally *not* part of ``part3`` and must remain opt-in until a reviewed
+    external audit proves >=30% historical-FP reduction with zero v67 regression.
+    """
+    output = copy.deepcopy(rows)
+    stats: Counter = Counter()
+    for entity in output:
+        assertions = list(entity.get("assertions") or [])
+        if "isHistorical" not in assertions:
+            continue
+        start, end = entity["position"]
+        left = text.rfind("\n\n", max(0, start - context_characters), start)
+        right = text.find("\n\n", end, min(len(text), end + context_characters))
+        context = text[left + 2 if left >= 0 else max(0, start - context_characters):
+                       right if right >= 0 else min(len(text), end + context_characters)]
+        if EDUCATION_CUE_RE.search(context) and not PATIENT_GROUNDING_RE.search(context):
+            entity["assertions"] = [name for name in assertions if name != "isHistorical"]
+            stats["removed_historical_education"] += 1
     return output, stats
 
 

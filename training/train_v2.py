@@ -15,7 +15,9 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 from .model_v2 import HybridNER
-from .predict_v2 import encoder_capacity
+from .predict_v2 import encoder_capacity, predict_text
+from .provenance import verify_dataset
+from .score_local import score as score_raw_predictions
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -268,6 +270,89 @@ def evaluate(model, loader, id_to_label, device):
     }
 
 
+@torch.no_grad()
+def evaluate_raw_documents(
+    model,
+    tokenizer,
+    meta: dict,
+    records: list[dict],
+    device,
+    *,
+    max_len: int,
+    max_words: int = 180,
+    overlap_words: int = 45,
+    prefix_subword_cap: int = 64,
+    ner_type_thresholds: dict | None = None,
+) -> dict:
+    """Evaluate the real inference/merge path on complete documents."""
+    gold = {}
+    predictions = {}
+    by_source: dict[str, list[str]] = {}
+    for index, record in enumerate(records):
+        record_id = str(record.get("id") or index)
+        if record_id in gold:
+            raise ValueError(f"Trùng raw validation id: {record_id}")
+        gold[record_id] = record.get("entities") or []
+        predictions[record_id] = predict_text(
+            record["text"], model, tokenizer, meta, device,
+            max_len=max_len,
+            max_words=max_words,
+            overlap_words=overlap_words,
+            prefix_subword_cap=prefix_subword_cap,
+            type_threshold=0.60,
+            disagreement_threshold=0.85,
+            assertion_threshold=0.60,
+            assertion_policy="part3",
+            assertion_aggregation="selected",
+            tokenizer_aware_windows=True,
+            ner_type_thresholds=ner_type_thresholds,
+        )
+        source = str(record.get("source") or record.get("record_kind") or "unknown")
+        by_source.setdefault(source, []).append(record_id)
+
+    raw = score_raw_predictions(gold, predictions)
+    overlap = raw["overlap"]["f1"] / 100.0
+    boundary = raw["boundary_f1_reference_only"] / 100.0
+    assertion = raw["assertion_micro_on_matched"]["f1"] / 100.0
+    overall_selection = 0.60 * overlap + 0.15 * boundary + 0.25 * assertion
+    source_reports = {}
+    for source, ids in sorted(by_source.items()):
+        subset = score_raw_predictions(
+            {key: gold[key] for key in ids},
+            {key: predictions[key] for key in ids},
+        )
+        source_reports[source] = subset
+    source_components = [
+        {
+            "overlap_f1": item["overlap"]["f1"] / 100.0,
+            "boundary_f1": item["boundary_f1_reference_only"] / 100.0,
+            "assertion_f1": item["assertion_micro_on_matched"]["f1"] / 100.0,
+        }
+        for item in source_reports.values()
+    ]
+    macro_by_source = {
+        name: sum(item[name] for item in source_components) / max(1, len(source_components))
+        for name in ("overlap_f1", "boundary_f1", "assertion_f1")
+    }
+    selection = (
+        0.60 * macro_by_source["overlap_f1"]
+        + 0.15 * macro_by_source["boundary_f1"]
+        + 0.25 * macro_by_source["assertion_f1"]
+    )
+    return {
+        "overlap_f1": overlap,
+        "boundary_f1": boundary,
+        "assertion_f1": assertion,
+        "selection_score": selection,
+        "overall_selection_score": overall_selection,
+        "selection_aggregation": "macro_by_source",
+        "weights": {"overlap": 0.60, "boundary": 0.15, "assertion": 0.25},
+        "scorer_report": raw,
+        "by_source": source_reports,
+        "macro_by_source": macro_by_source,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train hybrid BIO+span+assertion NER")
     parser.add_argument("--data-dir", "--data", dest="data_dir", required=True)
@@ -281,6 +366,14 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--eval-batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=3e-5)
+    parser.add_argument(
+        "--encoder-lr", type=float,
+        help="LR riêng backbone; mặc định dùng --lr",
+    )
+    parser.add_argument(
+        "--head-lr", type=float,
+        help="LR chung BIO/span/assertion heads; mặc định dùng --lr",
+    )
     parser.add_argument("--max-len", type=int, default=512)
     parser.add_argument("--warmup", type=float, default=0.1)
     parser.add_argument("--span-weight", type=float, default=0.5)
@@ -288,6 +381,32 @@ def main():
     parser.add_argument("--negative-span-ratio", type=float, default=2.0)
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--grad-accumulation", type=int, default=1)
+    parser.add_argument(
+        "--max-updates", type=int,
+        help="Dừng đúng số optimizer update; dùng để refit corpus khác kích thước",
+    )
+    parser.add_argument(
+        "--early-stopping-patience", type=int, default=0,
+        help="Số epoch không cải thiện selection trước khi dừng; 0=tắt",
+    )
+    parser.add_argument(
+        "--raw-validation",
+        help="Raw JSONL để chọn checkpoint end-to-end; mặc định raw_validation.jsonl trong data",
+    )
+    parser.add_argument(
+        "--raw-test",
+        help="Raw JSONL để báo cáo end-to-end; mặc định raw_test.jsonl trong data",
+    )
+    parser.add_argument("--eval-max-words", type=int, default=180)
+    parser.add_argument("--eval-overlap-words", type=int, default=45)
+    parser.add_argument("--prefix-subword-cap", type=int, default=64)
+    parser.add_argument(
+        "--disable-raw-eval", action="store_true",
+        help="Chỉ dùng metric window cũ; dành cho ablation/tương thích dataset cũ",
+    )
+    parser.add_argument("--require-provenance", action="store_true")
+    parser.add_argument("--require-dataset-variant", action="append", default=[])
+    parser.add_argument("--require-part3-sha256")
     parser.add_argument(
         "--targeted-id-prefix", action="append", default=[],
         help="Có thể lặp; record_id khớp một prefix sẽ thuộc nhóm targeted",
@@ -314,6 +433,10 @@ def main():
         parser.error("cần --model hoặc --init-checkpoint")
     if args.grad_accumulation < 1:
         parser.error("--grad-accumulation phải >= 1")
+    if args.max_updates is not None and args.max_updates < 1:
+        parser.error("--max-updates phải >= 1")
+    if args.early_stopping_patience < 0:
+        parser.error("--early-stopping-patience phải >= 0")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -322,6 +445,15 @@ def main():
         torch.cuda.manual_seed_all(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     data_dir = Path(args.data_dir)
+    try:
+        provenance = verify_dataset(
+            data_dir,
+            require_manifest=args.require_provenance,
+            allowed_variants=args.require_dataset_variant,
+            required_part3_sha256=args.require_part3_sha256,
+        )
+    except (FileNotFoundError, RuntimeError) as error:
+        raise SystemExit(f"Provenance preflight thất bại: {error}") from error
     labels = (data_dir / "labels.txt").read_text(encoding="utf-8").splitlines()
     label_to_id = {label: index for index, label in enumerate(labels)}
     id_to_label = {index: label for label, index in label_to_id.items()}
@@ -333,6 +465,16 @@ def main():
     train_rows = read_jsonl(data_dir / "train.jsonl")
     validation_rows = read_jsonl(data_dir / "validation.jsonl")
     test_rows = read_jsonl(data_dir / "test.jsonl")
+    raw_validation_path = Path(args.raw_validation) if args.raw_validation else data_dir / "raw_validation.jsonl"
+    raw_test_path = Path(args.raw_test) if args.raw_test else data_dir / "raw_test.jsonl"
+    raw_validation_rows = (
+        [] if args.disable_raw_eval or not raw_validation_path.is_file()
+        else read_jsonl(raw_validation_path)
+    )
+    raw_test_rows = (
+        [] if args.disable_raw_eval or not raw_test_path.is_file()
+        else read_jsonl(raw_test_path)
+    )
     train_data = HybridDataset(
         train_rows, tokenizer, label_to_id, args.max_len, args.negative_span_ratio, seed=args.seed
     )
@@ -395,9 +537,19 @@ def main():
             f"({capacity}); "
             f"dùng --max-len {capacity} trở xuống"
         )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    encoder_lr = args.encoder_lr if args.encoder_lr is not None else args.lr
+    head_lr = args.head_lr if args.head_lr is not None else args.lr
+    encoder_parameters = list(model.encoder.parameters())
+    encoder_ids = {id(parameter) for parameter in encoder_parameters}
+    head_parameters = [
+        parameter for parameter in model.parameters() if id(parameter) not in encoder_ids
+    ]
+    optimizer = torch.optim.AdamW([
+        {"params": encoder_parameters, "lr": encoder_lr},
+        {"params": head_parameters, "lr": head_lr},
+    ], weight_decay=0.01)
     updates_per_epoch = math.ceil(len(train_loader) / args.grad_accumulation)
-    total_steps = max(1, int(updates_per_epoch * args.epochs))
+    total_steps = args.max_updates or max(1, int(updates_per_epoch * args.epochs))
     scheduler = get_linear_schedule_with_warmup(
         optimizer, int(total_steps * args.warmup), total_steps
     )
@@ -414,10 +566,25 @@ def main():
         "seed": args.seed,
         "epochs": args.epochs,
         "lr": args.lr,
+        "encoder_lr": encoder_lr,
+        "head_lr": head_lr,
         "max_len": args.max_len,
         "grad_accumulation": args.grad_accumulation,
         "updates_per_epoch": updates_per_epoch,
+        "max_updates": args.max_updates,
+        "early_stopping_patience": args.early_stopping_patience,
         "sampler": sampler_report,
+        "provenance": provenance,
+        "raw_evaluation": {
+            "enabled": bool(raw_validation_rows),
+            "validation": str(raw_validation_path.resolve()) if raw_validation_rows else None,
+            "test": str(raw_test_path.resolve()) if raw_test_rows else None,
+            "validation_reuses_test": provenance["validation_reuses_test"],
+            "checkpoint_selection": (
+                "raw_end_to_end_0.60_overlap_0.15_boundary_0.25_assertion"
+                if raw_validation_rows else "legacy_window_0.80_bio_0.20_assertion"
+            ),
+        },
         "history": [],
     }
 
@@ -431,8 +598,20 @@ def main():
             "selected_epoch": epoch,
             "selection_metrics": metrics,
             "sampler": sampler_report,
+            "dataset_provenance": {
+                "variant": (provenance.get("manifest") or {}).get("variant"),
+                "part3_sha256": (
+                    ((provenance.get("manifest") or {}).get("part3_artifact") or {}).get("sha256")
+                ),
+                "split_sha256": {
+                    name: item["sha256"] for name, item in provenance["splits"].items()
+                },
+            },
         })
 
+    global_updates = 0
+    completed_epoch = 0
+    stale_epochs = 0
     for epoch in range(int(math.ceil(args.epochs))):
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -453,29 +632,83 @@ def main():
                 scaler.update()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                global_updates += 1
+                if args.max_updates is not None and global_updates >= args.max_updates:
+                    break
         metrics = evaluate(model, validation_loader, id_to_label, device)
+        metrics["window_selection_score"] = metrics["selection_score"]
+        if raw_validation_rows:
+            end_to_end = evaluate_raw_documents(
+                model, tokenizer,
+                {"labels": labels, "types": types, "assertions": assertions},
+                raw_validation_rows, device,
+                max_len=args.max_len,
+                max_words=args.eval_max_words,
+                overlap_words=args.eval_overlap_words,
+                prefix_subword_cap=args.prefix_subword_cap,
+            )
+            metrics["end_to_end"] = end_to_end
+            metrics["selection_score"] = end_to_end["selection_score"]
         print(f"[epoch {epoch + 1}] {json.dumps(metrics)}", flush=True)
         run_report["history"].append({"epoch": epoch + 1, **metrics})
         last_metrics = metrics
+        completed_epoch = epoch + 1
         if args.save_every_epoch:
             save_checkpoint(args.out + f"/epoch-{epoch + 1:03d}", epoch + 1, metrics)
         if metrics["selection_score"] > best:
             best = metrics["selection_score"]
             best_epoch = epoch + 1
             save_checkpoint(args.out + "/best", epoch + 1, metrics)
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+        if args.max_updates is not None and global_updates >= args.max_updates:
+            break
+        if args.early_stopping_patience and stale_epochs >= args.early_stopping_patience:
+            print(
+                f"[early-stop] {stale_epochs} epoch không cải thiện; best={best_epoch}",
+                flush=True,
+            )
+            break
     if args.save_last:
-        save_checkpoint(args.out + "/last", int(math.ceil(args.epochs)), last_metrics)
+        save_checkpoint(args.out + "/last", completed_epoch, last_metrics)
     run_report["best_epoch"] = best_epoch
     run_report["best_selection_score"] = best
+    run_report["completed_epochs"] = completed_epoch
+    run_report["completed_updates"] = global_updates
+    run_report["stopped_early"] = completed_epoch < int(math.ceil(args.epochs))
     (Path(args.out) / "training_report.json").write_text(
         json.dumps(run_report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    best_model, meta = HybridNER.load(args.out + "/best", device)
-    metrics = evaluate(best_model, test_loader, id_to_label, device)
+    def test_checkpoint(name: str) -> dict:
+        checkpoint = args.out + f"/{name}"
+        evaluated_model, _ = HybridNER.load(checkpoint, device)
+        metrics = evaluate(evaluated_model, test_loader, id_to_label, device)
+        metrics["evaluated_checkpoint"] = name
+        metrics["window_selection_score"] = metrics["selection_score"]
+        if raw_test_rows:
+            metrics["end_to_end"] = evaluate_raw_documents(
+                evaluated_model, tokenizer,
+                {"labels": labels, "types": types, "assertions": assertions},
+                raw_test_rows, device,
+                max_len=args.max_len,
+                max_words=args.eval_max_words,
+                overlap_words=args.eval_overlap_words,
+                prefix_subword_cap=args.prefix_subword_cap,
+            )
+        (Path(args.out) / f"test_metrics_{name}.json").write_text(
+            json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return metrics
+
+    best_metrics = test_checkpoint("best")
+    # Backward-compatible alias, now explicitly self-identifying.
     (Path(args.out) / "test_metrics.json").write_text(
-        json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(best_metrics, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    print(f"[test] {json.dumps(metrics)}")
+    if args.save_last:
+        test_checkpoint("last")
+    print(f"[test:best] {json.dumps(best_metrics)}")
 
 
 if __name__ == "__main__":
